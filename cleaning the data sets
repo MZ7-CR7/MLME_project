@@ -1,0 +1,62 @@
+import os
+import pandas as pd
+
+# --- Folder path where .txt files are located ---
+folder_path = r'C:\Users\Mohammed Zubair Khan\Downloads\MLME\project_release\release\Data'
+files = sorted([f for f in os.listdir(folder_path) if f.endswith('.txt')])
+
+# --- Optional: Folder to save cleaned files ---
+save_cleaned = True
+cleaned_folder = os.path.join(folder_path, "filtered")
+if save_cleaned:
+    os.makedirs(cleaned_folder, exist_ok=True)
+
+# --- IQR Outlier Filter Function ---
+def remove_outliers_iqr(df):
+    df_filtered = df.copy()
+    numeric_cols = df.select_dtypes(include='number').columns
+
+    for col in numeric_cols:
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        df_filtered = df_filtered[(df_filtered[col] >= lower_bound) & (df_filtered[col] <= upper_bound)]
+
+        # If everything is filtered out, exit early
+        if df_filtered.empty:
+            break
+
+    return df_filtered
+
+# --- Loop through files ---
+for file in files:
+    file_path = os.path.join(folder_path, file)
+    df = pd.read_csv(file_path, sep='\s+')
+
+    df_clean = remove_outliers_iqr(df)
+
+    print(f"\nFile: {file}")
+    print(f"Original rows: {len(df)}, After IQR filtering: {len(df_clean)}")
+
+    if save_cleaned and not df_clean.empty:
+        output_path = os.path.join(cleaned_folder, file)
+        df_clean.to_csv(output_path, sep='\t', index=False)
+
+
+combined_df = pd.DataFrame()
+
+for file in sorted(os.listdir(cleaned_folder)):
+    if file.endswith('.txt'):
+        file_path = os.path.join(cleaned_folder, file)
+        df = pd.read_csv(file_path, sep='\t')
+        
+        # Optional: Add file identifier column
+        df['source_file'] = file  
+        
+        combined_df = pd.concat([combined_df, df], ignore_index=True)
+
+# --- Save combined file ---
+combined_output_path = os.path.join(folder_path, 'combined_filtered_data.csv')
+combined_df.to_csv(combined_output_path, index=False)
