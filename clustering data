@@ -1,0 +1,123 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+
+# ----------------- Load and Extract Features -----------------
+folder_path = r'C:\Users\Mohammed Zubair Khan\Downloads\MLME\project_release\release\Data\filtered'
+files = sorted([f for f in os.listdir(folder_path) if f.endswith('.txt')])
+
+feature_vectors = []
+file_names = []
+
+for file in files:
+    file_path = os.path.join(folder_path, file)
+    df = pd.read_csv(file_path, sep='\s+')
+    file_names.append(file)
+
+    # Focus on key variables for crystallization
+    selected_cols = [ 'c','d50'	,'d90'	,'d10','T_PM','T_TM','mf_PM','mf_TM','Q_g','w_crystal' ]
+    stats = []
+
+    for col in selected_cols:
+        if col in df.columns:
+            series = df[col].dropna()
+            stats.extend([
+                np.mean(series),
+                np.std(series),
+                np.max(series) - np.min(series),
+                (series.iloc[-1] - series.iloc[0]) / len(series),
+                series.iloc[0],
+                series.iloc[-1]
+                        ])
+        else:
+            stats.extend([np.nan] * 6)  # Fill missing with NaN
+
+    feature_vectors.append(stats)
+
+X = np.array(feature_vectors)
+X = np.nan_to_num(X)  # Replace NaNs with 0
+# ----------------- Feature Names -----------------
+feature_vectors = []
+for col in selected_cols:
+    feature_vectors.extend([f'{col}_mean', f'{col}_std', f'{col}_range', f'{col}_slope',f'{col}_start', f'{col}_end'])
+
+# ----------------- Normalize -----------------
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# ----------------- PCA (10D for clustering) -----------------
+pca_10d = PCA(n_components=10)
+X_pca_10 = pca_10d.fit_transform(X_scaled)
+
+# ----------------- PCA (2D for visualization) -----------------
+pca_2d = PCA(n_components=2)
+X_pca_2 = pca_2d.fit_transform(X_scaled)
+
+# ----------------- Feature Contributions -----------------
+pca10_df = pd.DataFrame(pca_10d.components_.T, index=feature_vectors,columns=[f'PC{i+1}' for i in range(10)])
+
+pca2_df = pd.DataFrame(pca_2d.components_.T, index=feature_vectors, columns=['PC1_2D', 'PC2_2D'])
+
+print("Top contributing features to the 10D PCA (PC1):")
+print(pca10_df['PC1'].abs().sort_values(ascending=False).head(10))
+
+print("\nTop contributing features to the 2D PCA (PC1_2D):")
+print(pca2_df['PC1_2D'].abs().sort_values(ascending=False).head(10))
+# ----------------- K means Clustering -----------------
+kmeans = KMeans(n_clusters=3, random_state=42)
+kmeans_labels = kmeans.fit_predict(X_scaled)
+
+# ----------------- DBSCAN Clustering -----------------
+dbscan = DBSCAN(eps=7.7, min_samples=3)
+dbscan_labels = dbscan.fit_predict(X_scaled)
+
+# ----------------- Clustering Evaluation -----------------
+def evaluate_clustering(X, labels, method):
+    unique_labels = set(labels)
+    if len(unique_labels) > 1 and (len(unique_labels) - (-1 in unique_labels)) > 1:
+        sil = silhouette_score(X, labels)
+        dbi = davies_bouldin_score(X, labels)
+        ch = calinski_harabasz_score(X, labels)
+    else:
+        sil = dbi = ch = float('nan')
+
+    print(f"\n{method} Clustering Metrics:")
+    print(f"  Silhouette Score:       {sil:.3f}")
+    print(f"  Davies-Bouldin Index:   {dbi:.3f}")
+    print(f"  Calinski-Harabasz Score:{ch:.3f}")
+
+evaluate_clustering(X_scaled, kmeans_labels, "KMeans")
+evaluate_clustering(X_scaled, dbscan_labels, "DBSCAN")
+
+# ----------------- Visualization -----------------
+sns.set(style="whitegrid")
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+axes[0].scatter(X_pca_2[:, 0], X_pca_2[:, 1], c=kmeans_labels, cmap='tab10', s=70)
+axes[0].set_title('KMeans Clustering')
+axes[0].set_xlabel('PC1')
+axes[0].set_ylabel('PC2')
+
+axes[1].scatter(X_pca_2[:, 0], X_pca_2[:, 1], c=dbscan_labels, cmap='tab10', s=70)
+axes[1].set_title('DBSCAN Clustering')
+axes[1].set_xlabel('PC1')
+axes[1].set_ylabel('PC2')
+
+plt.tight_layout()
+plt.show()
+
+# ----------------- Cluster Assignment Output -----------------
+results_df = pd.DataFrame({
+    'File': file_names,
+    'KMeans_Cluster': kmeans_labels,
+    'DBSCAN_Cluster': dbscan_labels
+})
+
+print("\nCluster assignments:\n")
+print(results_df.sort_values(by='KMeans_Cluster'))
