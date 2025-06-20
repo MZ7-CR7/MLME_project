@@ -1,0 +1,206 @@
+import os
+
+import pandas as pd
+
+from matplotlib import pyplot as plt
+
+import seaborn as sns
+
+import numpy as np
+
+from sklearn.model_selection import train_test_split
+
+from sklearn.linear_model import LinearRegression
+
+from sklearn.metrics import mean_squared_error, r2_score
+
+# regularization
+
+from sklearn.linear_model import Ridge, Lasso
+
+from sklearn.preprocessing import PolynomialFeatures
+
+from sklearn.preprocessing import StandardScaler
+
+# Path to folder with .txt files
+
+folder_path = r"C:\Users\Mohammed Zubair Khan\Downloads\MLME\project_release\release\Data"  
+# UPDATE this to your real path
+
+
+# List to hold dataframes
+
+data_list = []
+
+
+
+# Loop through all .txt files
+
+for file_name in os.listdir(folder_path):
+
+    if file_name.endswith(".txt"):
+
+        file_path = os.path.join(folder_path, file_name)
+
+        print(f"Loading: {file_name}")
+
+
+
+        # Load each file as a DataFrame
+
+        df = pd.read_csv(file_path, delimiter="\t")  # Tab-separated
+
+        data_list.append(df)
+
+
+
+# Combine all into one DataFrame
+
+data = pd.concat(data_list, ignore_index=True)
+
+
+
+
+
+#######################################heat map
+
+inputs = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal', 'c_in', 'T_PM_in', 'T_TM_in']
+
+outputs = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+
+# Select input and output columns
+
+df_subset = data[inputs + outputs].dropna()
+
+
+
+corr_matrix = df_subset.corr()
+
+
+
+# Extract correlation between inputs and outputs only
+
+corr_inputs_outputs = corr_matrix.loc[outputs, inputs]
+
+
+
+plt.figure(figsize=(10, 6))
+
+sns.heatmap(corr_inputs_outputs, annot=True, cmap='coolwarm', center=0)
+
+plt.title("Correlation: Outputs vs Inputs")
+
+plt.show()
+
+#######################################visualize
+
+
+
+# Loop through each input-output pair and plot
+
+dt = 1.0  # for example: 1 second between samples
+
+# Generate time values
+data['time'] = np.arange(len(data)) * dt
+
+for out_col in outputs:
+    plt.figure(figsize=(12, 4))
+    sns.lineplot(data=data, x='time', y=out_col)
+    plt.title(f"Time Series of {out_col}")
+    plt.xlabel("Time")
+    plt.ylabel(out_col)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+    ##############################cluster
+
+from sklearn.preprocessing import StandardScaler
+
+from sklearn.decomposition import PCA
+
+from sklearn.cluster import KMeans
+
+features = data[inputs + outputs]
+
+# Scale features
+
+scaler = StandardScaler()
+
+scaled_features = scaler.fit_transform(features)
+
+pca = PCA(n_components=2)
+
+pca_features = pca.fit_transform(scaled_features)
+
+kmeans = KMeans(n_clusters=3, random_state=1)
+
+cluster_labels = kmeans.fit_predict(pca_features)
+
+
+
+# 3. Print component weights (how much each original feature contributes)
+
+# Assume this is your source file
+source_file = "your_file.csv"  # <- Replace with your actual file name
+
+# Get the PCA loadings (feature weights)
+loadings = pd.DataFrame(
+    pca.components_, 
+    columns=features.columns, 
+    index=["PC1", "PC2"]
+)
+
+print("PCA Component Loadings (feature contributions):")
+print(loadings)
+
+print(f"\nNote: These features come from the file: {source_file}")
+
+# Identify top contributing features to each PC
+print("\nTop contributing features for each Principal Component:")
+for pc in loadings.index:
+    sorted_features = loadings.loc[pc].abs().sort_values(ascending=False)
+    print(f"\n{pc} - Top contributing features (from {source_file}):")
+    print(sorted_features.head(5))
+
+# 4. Optional: Print how much variance each PC explains
+
+print("\nExplained variance ratio:")
+print(pca.explained_variance_ratio_)
+
+
+
+# 4. Optional: Print how much variance each PC explains
+
+print("\nExplained variance ratio:")
+
+print(pca.explained_variance_ratio_)
+
+
+
+
+
+# Add cluster labels back to original data
+
+features['Cluster'] = cluster_labels
+
+plt.figure(figsize=(8, 6))
+
+sns.scatterplot(x=pca_features[:, 0], y=pca_features[:, 1],
+
+                hue=cluster_labels, palette='Set2', s=60)
+
+plt.xlabel('PCA Component 1')
+
+plt.ylabel('PCA Component 2')
+
+plt.title('K-Means Clustering (PCA-reduced Features)')
+
+plt.legend(title='Cluster')
+
+plt.show()
+
+
+
+
