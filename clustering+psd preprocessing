@@ -1,0 +1,135 @@
+import os
+import shutil
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+
+# ----------------- Load and Reshape Time Series -----------------
+folder_path = r'C:\Users\fhesh\OneDrive\Desktop\New PC\Eng. Fares\Lectures\Lecture notes and handouts\TU Dortmund Courses\MLME\project_release\release\Data'
+files = sorted([f for f in os.listdir(folder_path) if f.endswith('.txt')])
+
+full_data_vectors = []
+file_names = []
+
+for file in files:
+    file_path = os.path.join(folder_path, file)
+    df = pd.read_csv(file_path, sep='\s+')
+
+    if df.shape != (1000, 13):
+        print(f"Skipping {file}: shape {df.shape} is invalid.")
+        continue
+
+    flattened = df.values.flatten()  # Shape: (13000,)
+    full_data_vectors.append(flattened)
+    file_names.append(file)
+
+X = np.stack(full_data_vectors)
+
+# ----------------- Scaling and PCA -----------------
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+pca_10d = PCA(n_components=10)
+X_pca_10 = pca_10d.fit_transform(X_scaled)
+
+pca_2d = PCA(n_components=2)
+X_pca_2 = pca_2d.fit_transform(X_scaled)
+
+# ----------------- KMeans Clustering -----------------
+kmeans = KMeans(n_clusters=2, random_state=42)
+kmeans_labels = kmeans.fit_predict(X_pca_10)
+
+# ----------------- Metrics -----------------
+def compute_metrics(X, labels):
+    if len(set(labels)) > 1:
+        sil = silhouette_score(X, labels)
+        db = davies_bouldin_score(X, labels)
+        ch = calinski_harabasz_score(X, labels)
+    else:
+        sil = db = ch = float('nan')
+    print(f"\nKMeans Clustering Metrics:")
+    print(f"Silhouette Score: {sil:.3f}")
+    print(f"Davies-Bouldin Index: {db:.3f}")
+    print(f"Calinski-Harabasz Score: {ch:.3f}")
+
+compute_metrics(X_pca_10, kmeans_labels)
+
+# ----------------- Save Clustering Results -----------------
+clustered_files = pd.DataFrame({'file': file_names, 'kmeans': kmeans_labels})
+
+# Create or reset output directories
+output_base = os.path.join(folder_path, 'clustered_output')
+os.makedirs(output_base, exist_ok=True)
+
+for cluster_id in [0, 1]:
+    cluster_dir = os.path.join(output_base, f'cluster_{cluster_id}')
+    if os.path.exists(cluster_dir):
+        shutil.rmtree(cluster_dir)
+    os.makedirs(cluster_dir)
+
+# Copy files to cluster folders
+for file, label in zip(file_names, kmeans_labels):
+    src_path = os.path.join(folder_path, file)
+    dst_folder = os.path.join(output_base, f'cluster_{label}')
+    shutil.copy2(src_path, dst_folder)
+
+# ----------------- Save File Lists -----------------
+for cluster_id in [0, 1]:
+    file_list = clustered_files[clustered_files.kmeans == cluster_id]['file'].tolist()
+    list_path = os.path.join(output_base, f'cluster_{cluster_id}_files.txt')
+    with open(list_path, 'w') as f:
+        for fname in file_list:
+            f.write(f"{fname}\n")
+
+# ----------------- Visualization -----------------
+sns.set(style="whitegrid")
+plt.figure(figsize=(6, 5))
+scatter = plt.scatter(X_pca_2[:, 0], X_pca_2[:, 1], c=kmeans_labels, cmap='tab10', s=50)
+plt.title('KMeans Clustering (PCA 2D)')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.legend(*scatter.legend_elements(), title="Clusters")
+plt.tight_layout()
+plt.show()
+
+
+# ----------------- Preprocessing and Visualization for Sample Files -----------------
+
+# Define PSD variable names (update as needed)
+psd_vars = ['d50', 'd90', 'd10']  # Replace with actual PSD column names
+
+# Define q98 clipping
+def clip_q98(x):
+    q1, q99 = np.percentile(x, [1, 99])
+    return np.clip(x, q1, q99)
+
+# Create new directories for preprocessed PSD files
+psd_preprocessed_base = os.path.join(folder_path, 'preprocessed_psd_q98')
+os.makedirs(psd_preprocessed_base, exist_ok=True)
+
+for cluster_id in [0, 1]:
+    cluster_src_dir = os.path.join(output_base, f'cluster_{cluster_id}')
+    cluster_dst_dir = os.path.join(psd_preprocessed_base, f'cluster_{cluster_id}_q98')
+
+    if os.path.exists(cluster_dst_dir):
+        shutil.rmtree(cluster_dst_dir)
+    os.makedirs(cluster_dst_dir)
+
+    file_list = sorted([f for f in os.listdir(cluster_src_dir) if f.endswith('.txt')])
+
+    for fname in file_list:
+        fpath = os.path.join(cluster_src_dir, fname)
+        df = pd.read_csv(fpath, sep='\s+')
+
+        for var in psd_vars:
+            if var in df.columns:
+                df[var] = clip_q98(df[var].values)
+
+        df.to_csv(os.path.join(cluster_dst_dir, fname), sep='\t', index=False)
+
+print("Preprocessed PSD files saved into separate q98 folders for each cluster.")
