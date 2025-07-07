@@ -1,0 +1,83 @@
+#Non linear data
+
+torch.manual_seed(0)
+x = torch.linspace(-5, 5, 300).unsqueeze(1)  # Shape: [300, 1]
+y = (
+    torch.sin(x) * torch.exp(-x**2 / 10)     # bell-shaped sine curve
+    + 0.3 * torch.cos(5 * x)                 # high-frequency noise
+    + 0.1 * x**3                             # add a cubic trend
+    + 0.5 * torch.randn_like(x)             # random noise
+)
+
+#NARX-style model with two quantiles
+class NARX_NN_model(nn.Module):
+    def __init__(self, input_size, hidden_size=20): #one hidden layer
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 2)  # 2 outputs: 5th and 95th quantile
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+#PinballLoss fuction
+class PinballLoss(nn.Module):
+    def __init__(self, taus):
+        super().__init__()
+        self.taus = taus  # list of quantiles, e.g., [0.05, 0.95]
+
+    def forward(self, y_pred, y_true):
+        total_loss = 0
+        for i, tau in enumerate(self.taus):
+            error = y_true - y_pred[:, i:i+1]
+            loss = torch.where(error >= 0,
+                               tau * error,
+                               (1 - tau) * -error)
+            total_loss += torch.mean(loss)
+        return total_loss / len(self.taus)
+
+#Prepare model and training setup
+taus = [0.05, 0.95]
+model = NARX_NN_model(input_size=1)  # input is x with shape [N, 1]
+loss_fn = PinballLoss(taus)
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+
+#Training loop
+for epoch in range(200):
+    model.train()
+    y_pred = model(x)              # shape: [N, 2]
+    loss = loss_fn(y_pred, y)      # y: [N, 1]
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 50 == 0:
+        print(f"Epoch {epoch} | Pinball Loss: {loss.item():.4f}")
+
+#Plot results
+model.eval()
+with torch.no_grad():
+    y_hat = model(x)
+    y_5 = y_hat[:, 0]
+    y_95 = y_hat[:, 1]
+
+
+# Plot it
+plt.figure(figsize=(8, 5))
+plt.scatter(x.numpy(), y.numpy(), alpha=0.5, label="Non-linear (fake) data")
+plt.plot(x, y_5, label='5th percentile', color='blue')
+plt.plot(x, y_95, label='95th percentile', color='red')
+plt.fill_between(x.squeeze(), y_5, y_95, color='gray', alpha=0.2)
+plt.title("Quantile Regression Extremely Non-Linear Data")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+#Computing coverage of quantiles
+coverage = ((y.squeeze() >= y_5) & (y.squeeze() <= y_95)).float().mean().item()
+print(f"Empirical Coverage: {coverage*100:.2f}%")
