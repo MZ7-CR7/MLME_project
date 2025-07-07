@@ -1,0 +1,236 @@
+import numpy as np
+import pandas as pd
+import os
+import shutil
+from sklearn.utils import shuffle
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+import joblib  # for saving scalers
+
+# === User parameters ===
+file_dir = r'C:\Users\Mohammed Zubair Khan\Downloads\MLME\project_release\release\Data\preprocessed_psd_q98\cluster_0_q98'
+save_scaled_files = True
+
+# Define input and output columns
+input_cols = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']
+output_cols = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+
+# === Step 1: Load and shuffle all files ===
+all_files = shuffle(os.listdir(file_dir), random_state=42)
+assert len(all_files) == 45, "Expected exactly 45 files!"
+
+# === Step 2: Split test and train ===
+test_files = all_files[:9]
+train_files = all_files[9:]  # 36 files
+
+# === Step 3: Concatenate training files and compute mean/std ===
+train_dfs = []
+for f in train_files:
+    df = pd.read_csv(os.path.join(file_dir, f), delim_whitespace=True, header=0)
+    df = df.apply(pd.to_numeric, errors='coerce')
+    train_dfs.append(df)
+
+train_data = pd.concat(train_dfs, axis=0)
+train_data = train_data.dropna()
+
+mean = train_data.mean()
+std = train_data.std()
+
+# Save scalers for reproducibility
+os.makedirs('scalers', exist_ok=True)
+joblib.dump(mean, 'scalers/train_mean.pkl')
+joblib.dump(std, 'scalers/train_std.pkl')
+
+# === Step 4: Scaling Function ===
+def scale_df(df, mean, std):
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df_scaled = (df - mean) / std
+    return df_scaled.dropna(axis=1)
+
+# === Step 5: Scale training files and save ===
+print("\n✅ Scaled Training Files:")
+scaled_train_dir = os.path.join('scaled_output', 'fold_no_kfold', 'train')
+for f in train_files:
+    df = pd.read_csv(os.path.join(file_dir, f), delim_whitespace=True, header=0)
+    df_scaled = scale_df(df, mean, std)
+    if save_scaled_files and not df_scaled.empty:
+        os.makedirs(scaled_train_dir, exist_ok=True)
+        df_scaled.to_csv(os.path.join(scaled_train_dir, f), sep=' ', header=True, index=False)
+
+# === Step 6: Scale test files using training mean/std and save ===
+print("\n✅ Scaled Test Files:")
+scaled_test_dir = os.path.join('scaled_output', 'fold_no_kfold', 'test_scaled')
+for f in test_files:
+    df = pd.read_csv(os.path.join(file_dir, f), delim_whitespace=True, header=0)
+    df_scaled = scale_df(df, mean, std)  # scale with training stats
+    if save_scaled_files and not df_scaled.empty:
+        os.makedirs(scaled_test_dir, exist_ok=True)
+        df_scaled.to_csv(os.path.join(scaled_test_dir, f), sep=' ', header=True, index=False)
+
+# Also save the original unscaled test files separately (optional)
+test_save_path = os.path.join('scaled_output', 'fold_no_kfold', 'test_unscaled')
+if save_scaled_files:
+    os.makedirs(test_save_path, exist_ok=True)
+    for f in test_files:
+        shutil.copy(os.path.join(file_dir, f), os.path.join(test_save_path, f))
+
+# === Step 7: Build NARX matrices from scaled files ===
+def build_narx_matrices(files, file_dir, input_cols, output_cols, o_lag, i_lag):
+    max_lag = max(o_lag, i_lag)
+    X_all = []
+    Y_all = []
+
+    for f in files:
+        path = os.path.join(file_dir, f)
+        df = pd.read_csv(path, sep='\s+', header=0)
+        
+        inputs = df[input_cols].values
+        outputs = df[output_cols].values
+        T = len(df)
+
+        X_file = []
+        Y_file = []
+
+        for t in range(max_lag, T):
+            past_outputs = outputs[t - o_lag:t][::-1].flatten()
+            past_inputs = inputs[t - i_lag:t][::-1].flatten()
+
+            X_file.append(np.hstack([past_outputs, past_inputs]))
+            Y_file.append(outputs[t])  # fix here: use current t output, not fixed max_lag
+
+        X_all.append(np.array(X_file))
+        Y_all.append(np.array(Y_file))
+
+    X_all = np.vstack(X_all)
+    Y_all = np.vstack(Y_all)
+
+    return X_all, Y_all
+
+o_lag = 3  # output lag
+i_lag = 5  # input lag
+
+# Use the scaled training data directory
+X_train, Y_train = build_narx_matrices(train_files, scaled_train_dir, input_cols, output_cols, o_lag, i_lag)
+print("X_train shape:", X_train.shape)
+print("Y_train shape:", Y_train.shape)
+
+# Convert to PyTorch tensors
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+Y_train_tensor = torch.tensor(Y_train, dtype=torch.float32)
+
+# Dataset and DataLoader
+train_dataset = torch.utils.data.TensorDataset(X_train_tensor, Y_train_tensor)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+# Neural network model
+class NARXNet(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(NARXNet, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = NARXNet(X_train.shape[1], Y_train.shape[1])
+loss_fn = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+n_epochs = 100
+
+for epoch in range(n_epochs):
+    model.train()
+    epoch_loss = 0
+    for xb, yb in train_loader:
+        optimizer.zero_grad()
+        pred = model(xb)
+        loss = loss_fn(pred, yb)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}: Train MSE = {epoch_loss / len(train_loader):.5f}")
+
+# Build test matrices from scaled test files
+X_test, Y_test = build_narx_matrices(test_files, scaled_test_dir, input_cols, output_cols, o_lag, i_lag)
+print("X_test shape:", X_test.shape)
+print("Y_test shape:", Y_test.shape)
+
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+Y_test_tensor = torch.tensor(Y_test, dtype=torch.float32)
+
+model.eval()
+with torch.no_grad():
+    Y_pred_tensor = model(X_test_tensor)
+
+# Convert to numpy
+Y_pred_scaled = Y_pred_tensor.numpy()
+Y_true_scaled = Y_test_tensor.numpy()
+
+# Inverse scale outputs (using training mean/std)
+mean_out = mean[output_cols].values
+std_out = std[output_cols].values
+
+def inverse_scale(Y_scaled, mean, std):
+    return Y_scaled * std + mean
+
+Y_pred = inverse_scale(Y_pred_scaled, mean_out, std_out)
+Y_true = inverse_scale(Y_true_scaled, mean_out, std_out)
+
+# Metrics on original scale
+output_names = output_cols  # ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+
+
+
+# Output variable names
+output_names = output_cols
+
+# Collect per-variable metrics
+mse_list = []
+mae_list = []
+r2_list = []
+
+for i in range(Y_true.shape[1]):
+    mse_list.append(mean_squared_error(Y_true[:, i], Y_pred[:, i]))
+    mae_list.append(mean_absolute_error(Y_true[:, i], Y_pred[:, i]))
+    r2_list.append(r2_score(Y_true[:, i], Y_pred[:, i]))
+
+# Create DataFrame for metrics
+metrics_df = pd.DataFrame({
+    'State': output_names,
+    'MSE': mse_list,
+    'MAE': mae_list,
+    'R²': r2_list
+})
+
+# Format scientific notation
+pd.set_option('display.float_format', '{:.3e}'.format)
+
+# Print nicely
+print(metrics_df.to_string(index=False))
+
+
+# Plot trajectories
+output_names = output_cols
+
+plt.figure(figsize=(18, 12))
+for i in range(Y_true.shape[1]):
+    plt.subplot(3, 2, i + 1)
+    plt.scatter(range(len(Y_true[:, i])), Y_true[:, i], color='blue', label='Actual', alpha=0.6, s=10)
+    plt.plot(Y_pred[:, i], 'r--', label='Predicted')  # Dashed red line
+    plt.title(f'{output_cols[i]} Trajectory')
+    plt.xlabel('Time Step')
+    plt.ylabel(output_cols[i])
+    plt.legend()
+    plt.grid(True)
+
+plt.tight_layout()
+plt.show()
