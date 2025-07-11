@@ -1,0 +1,897 @@
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from typing import List
+import random
+import gc
+import math
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import os
+import json
+import optuna
+from optuna.samplers import TPESampler
+import optuna.visualization.matplotlib as vis
+from optuna.pruners import MedianPruner
+from optuna.exceptions import TrialPruned
+# ----------------- Load and Reshape Time Series -----------------
+folder_path = r'C:\Users\fhesh\OneDrive\Desktop\New PC\Eng. Fares\Lectures\Lecture notes and handouts\TU Dortmund Courses\MLME\project_release\release\Data'
+files = sorted([f for f in os.listdir(folder_path) if f.endswith('.txt')])
+
+full_data_vectors = []
+file_names = []
+
+for file in files:
+    file_path = os.path.join(folder_path, file)
+    df = pd.read_csv(file_path, sep='\s+')
+
+    if df.shape != (1000, 13):
+        print(f"Skipping {file}: shape {df.shape} is invalid.")
+        continue
+
+    flattened = df.values.flatten()  # Shape: (13000,)
+    full_data_vectors.append(flattened)
+    file_names.append(file)
+
+X = np.stack(full_data_vectors)
+
+# ----------------- Scaling and PCA -----------------
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+pca_10d = PCA(n_components=10)
+X_pca_10 = pca_10d.fit_transform(X_scaled)
+
+pca_2d = PCA(n_components=2)
+X_pca_2 = pca_2d.fit_transform(X_scaled)
+
+# ----------------- KMeans Clustering -----------------
+kmeans = KMeans(n_clusters=2, random_state=42)
+kmeans_labels = kmeans.fit_predict(X_pca_10)
+
+# ----------------- Metrics -----------------
+def compute_metrics(X, labels):
+    if len(set(labels)) > 1:
+        sil = silhouette_score(X, labels)
+        db = davies_bouldin_score(X, labels)
+        ch = calinski_harabasz_score(X, labels)
+    else:
+        sil = db = ch = float('nan')
+    print(f"\nKMeans Clustering Metrics:")
+    print(f"Silhouette Score: {sil:.3f}")
+    print(f"Davies-Bouldin Index: {db:.3f}")
+    print(f"Calinski-Harabasz Score: {ch:.3f}")
+
+compute_metrics(X_pca_10, kmeans_labels)
+
+# ----------------- Save Clustering Results -----------------
+clustered_files = pd.DataFrame({'file': file_names, 'kmeans': kmeans_labels})
+
+# Create or reset output directories
+output_base = os.path.join(folder_path, 'clustered_output')
+os.makedirs(output_base, exist_ok=True)
+
+for cluster_id in [0, 1]:
+    cluster_dir = os.path.join(output_base, f'cluster_{cluster_id}')
+    if os.path.exists(cluster_dir):
+        shutil.rmtree(cluster_dir)
+    os.makedirs(cluster_dir)
+
+# Copy files to cluster folders
+for file, label in zip(file_names, kmeans_labels):
+    src_path = os.path.join(folder_path, file)
+    dst_folder = os.path.join(output_base, f'cluster_{label}')
+    shutil.copy2(src_path, dst_folder)
+
+# ----------------- Save File Lists -----------------
+for cluster_id in [0, 1]:
+    file_list = clustered_files[clustered_files.kmeans == cluster_id]['file'].tolist()
+    list_path = os.path.join(output_base, f'cluster_{cluster_id}_files.txt')
+    with open(list_path, 'w') as f:
+        for fname in file_list:
+            f.write(f"{fname}\n")
+
+# ----------------- Visualization -----------------
+sns.set(style="whitegrid")
+plt.figure(figsize=(6, 5))
+scatter = plt.scatter(X_pca_2[:, 0], X_pca_2[:, 1], c=kmeans_labels, cmap='tab10', s=50)
+plt.title('KMeans Clustering (PCA 2D)')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.legend(*scatter.legend_elements(), title="Clusters")
+plt.tight_layout()
+plt.show()
+
+
+# ----------------- Preprocessing and Visualization for all Files -----------------
+
+# Define PSD variable names (update as needed)
+psd_vars = ['d50', 'd90', 'd10']  # Replace with actual PSD column names
+
+# Define q98 clipping
+def clip_q98(x):
+    q1, q99 = np.percentile(x, [1, 99])
+    return np.clip(x, q1, q99)
+
+# Create new directories for preprocessed PSD files
+psd_preprocessed_base = os.path.join(folder_path, 'preprocessed_psd_q98')
+os.makedirs(psd_preprocessed_base, exist_ok=True)
+
+for cluster_id in [0, 1]:
+    cluster_src_dir = os.path.join(output_base, f'cluster_{cluster_id}')
+    cluster_dst_dir = os.path.join(psd_preprocessed_base, f'cluster_{cluster_id}_q98')
+
+    if os.path.exists(cluster_dst_dir):
+        shutil.rmtree(cluster_dst_dir)
+    os.makedirs(cluster_dst_dir)
+
+    file_list = sorted([f for f in os.listdir(cluster_src_dir) if f.endswith('.txt')])
+
+    for fname in file_list:
+        fpath = os.path.join(cluster_src_dir, fname)
+        df = pd.read_csv(fpath, sep='\s+')
+
+        for var in psd_vars:
+            if var in df.columns:
+                df[var] = clip_q98(df[var].values)
+
+        df.to_csv(os.path.join(cluster_dst_dir, fname), sep='\t', index=False)
+
+print("Preprocessed PSD files saved into separate q98 folders for each cluster.")
+
+# ---------------------------- Configuration ----------------------------
+script_dir = os.path.dirname(os.path.abspath(__file__))
+output_base = os.path.join(script_dir, 'preprocessed_psd_q98')  # Path to preprocessed clusters
+
+
+# --------------------- Step 1A: Generate file lists ---------------------
+print("🔍 Creating file lists for each cluster...")
+
+for cluster_name in os.listdir(output_base):
+    cluster_dir = os.path.join(output_base, cluster_name)
+    if not os.path.isdir(cluster_dir) or not cluster_name.startswith("cluster_"):
+        continue
+
+    list_path = os.path.join(output_base, f"{cluster_name}_files.txt")
+    if os.path.exists(list_path) and os.path.getsize(list_path) > 0:
+        print(f"✅ {cluster_name}_files.txt already exists and is non-empty. Skipping.")
+        continue
+
+    file_list = [
+        fname for fname in os.listdir(cluster_dir)
+        if fname.endswith(".txt")
+    ]
+
+    with open(list_path, 'w') as f:
+        f.writelines(f"{fname}\n" for fname in sorted(file_list))
+
+    print(f"📄 {cluster_name}_files.txt created with {len(file_list)} files.")
+
+
+# ------------------ Step 1B: Shuffle and split files -------------------
+print("\n🔀 Splitting files into trainval/test sets...")
+
+test_ratio = 0.15  # 15% for testing
+
+for cluster_name in os.listdir(output_base):
+    cluster_dir = os.path.join(output_base, cluster_name)
+    if not os.path.isdir(cluster_dir) or not cluster_name.startswith("cluster_"):
+        continue
+
+    file_list_path = os.path.join(output_base, f"{cluster_name}_files.txt")
+    if not os.path.exists(file_list_path):
+        raise FileNotFoundError(f"Missing file list: {file_list_path}")
+
+    with open(file_list_path, 'r') as f:
+        all_files = [line.strip() for line in f if line.strip()]
+
+    rng = random.Random(42)  # or whatever seed you want
+    rng.shuffle(all_files)
+    num_test = max(1, int(len(all_files) * test_ratio))
+    test_files = all_files[:num_test]
+    trainval_files = all_files[num_test:]
+
+    with open(os.path.join(cluster_dir, 'test_files.txt'), 'w') as f:
+        f.writelines(f"{fname}\n" for fname in test_files)
+
+    with open(os.path.join(cluster_dir, 'trainval_files.txt'), 'w') as f:
+        f.writelines(f"{fname}\n" for fname in trainval_files)
+
+    print(f"✅ {cluster_name}: {len(trainval_files)} trainval, {len(test_files)} test files saved.")
+
+print("\n🎉 All file lists and splits created successfully!")
+
+
+# ---------------------- Utility Functions ----------------------
+def load_file(file_path):
+    return pd.read_csv(file_path, sep='\t')
+
+def list_cluster_folders(base_path):
+    return sorted([f for f in os.listdir(base_path) if f.startswith('cluster_') and f.endswith('_q98')])
+
+def get_trainval_test_files(cluster_folder):
+    with open(os.path.join(cluster_folder, 'trainval_files.txt')) as f:
+        trainval = [line.strip() for line in f]
+    with open(os.path.join(cluster_folder, 'test_files.txt')) as f:
+        test = [line.strip() for line in f]
+    return trainval, test
+
+def construct_lagged_matrix(df, input_vars, output_vars, input_lag, output_lag):
+    max_lag = max(input_lag, output_lag)
+    X, Y = [], []
+    for t in range(max_lag, len(df)):
+        x_t = []
+
+        # First: output lags (t-1 to t-output_lag)
+        for lag in range(1, output_lag + 1):
+            x_t.extend(df[output_vars].iloc[t - lag].values)
+
+        # Then: input lags (t-1 to t-input_lag)
+        for lag in range(1, input_lag + 1):
+            x_t.extend(df[input_vars].iloc[t - lag].values)
+
+        # Target at time t (not lagged)
+        y_t = df[output_vars].iloc[t].values
+
+        X.append(x_t)
+        Y.append(y_t)
+
+    return np.array(X), np.array(Y)
+
+# ---------------------- Neural Network ----------------------
+class NARXNet(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_units, num_layers):
+        super().__init__()
+        layers = []
+        in_dim = input_dim
+        for _ in range(num_layers):
+            layers.append(nn.Linear(in_dim, hidden_units))
+            layers.append(nn.ReLU())
+            in_dim = hidden_units
+        layers.append(nn.Linear(in_dim, output_dim))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+def verify_lagged_matrix_construction(df, input_vars, output_vars, input_lag, output_lag):
+    max_lag = max(input_lag, output_lag)
+    if len(df) <= max_lag:
+        print("❌ Data too short for the requested lags.")
+        return
+
+    print("\n📋 Raw Data Snapshot (for time steps involved):")
+    print(df.iloc[max_lag - input_lag - output_lag : max_lag + 1][input_vars + output_vars])
+
+    X, Y = construct_lagged_matrix(df, input_vars, output_vars, input_lag, output_lag)
+    x0, y0 = X[0], Y[0]  # First sample
+
+    print("\n🔍 First constructed input vector X[0] breakdown:")
+
+    idx = 0
+    # First: output lags
+    for lag in range(1, output_lag + 1):
+        print(f"\n📦 Output lag t-{lag}:")
+        for var in output_vars:
+            val = x0[idx]
+            print(f"  {var}(t-{lag}) = {val}")
+            idx += 1
+
+    # Then: input lags
+    for lag in range(1, input_lag + 1):
+        print(f"\n📦 Input lag t-{lag}:")
+        for var in input_vars:
+            val = x0[idx]
+            print(f"  {var}(t-{lag}) = {val}")
+            idx += 1
+
+    print("\n🎯 Target output vector Y[0] (t={max_lag}):")
+    for i, var in enumerate(output_vars):
+        print(f"  {var}(t) = {y0[i]}")
+
+    print("\n✅ Verification complete.")
+
+#def plot_optuna_convergence(study):
+    #import matplotlib.pyplot as plt
+   # best_values = []
+ #   running_min = float('inf')
+  #  for t in study.trials:
+   #     if t.value is not None and t.value < running_min:
+    #        running_min = t.value
+     #   best_values.append(running_min)
+
+    #plt.figure(figsize=(6, 4))
+    #plt.plot(best_values, marker='o')
+    #plt.xlabel('Trial')
+    #plt.ylabel('Best Value Found So Far')
+    #plt.title('Optuna Convergence Plot')
+    #plt.grid(True)
+    #plt.tight_layout()
+    #plt.show()
+# ---------------------- BO Evaluation ----------------------
+def evaluate_model(cluster_folder, trial, seed=42, early_stopping_patience=10, verify_lagging=False):
+    input_vars = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']
+    output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    OPTIMIZER_MAP = {'adam': torch.optim.Adam, 'sgd': torch.optim.SGD}
+    device = torch.device('cpu')
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+
+    print(f"Starting evaluate_model on cluster folder: {cluster_folder}", flush=True)
+
+    input_lag = trial.suggest_int('input_lag', 1, 5)  
+    output_lag = trial.suggest_int('output_lag', 1, 5)
+    hidden_units = trial.suggest_int('hidden_units', 20, 50) 
+    num_layers = trial.suggest_int('num_layers', 1, 2)
+    lr = trial.suggest_float('lr', 1e-4, 1e-3, log=True) 
+    weight_decay = trial.suggest_float('weight_decay', 1e-5, 1e-4, log=True)
+    batch_size = trial.suggest_categorical('batch_size', [32, 64]) 
+    optimizer_name = trial.suggest_categorical('optimizer', ['adam'])
+    num_epochs = trial.suggest_int('epochs', 20, 50)  
+
+    trainval_files, _ = get_trainval_test_files(cluster_folder)
+    file_paths = np.array([os.path.join(cluster_folder, fname) for fname in trainval_files])
+    if len(file_paths) == 0:
+        return float('inf')
+
+    all_dfs = [load_file(fp) for fp in file_paths]
+
+    file_indices = []
+    lengths = []
+    start = 0
+    for df in all_dfs:
+        lengths.append(len(df))
+        file_indices.append((start, start + len(df)))
+        start += len(df)
+
+    print("Starting 3-fold cross-validation splitting", flush=True)
+    kf = KFold(n_splits=3, shuffle=True, random_state=seed)
+    fold_losses = []
+
+    for fold_idx, (train_idx, val_idx) in enumerate(kf.split(file_paths), 1):
+        print(f"\n--- Fold {fold_idx} ---", flush=True)
+
+        train_dfs = [all_dfs[i] for i in train_idx]
+        val_dfs = [all_dfs[i] for i in val_idx]
+
+        concat_train = pd.concat(train_dfs, ignore_index=True)
+        scaler_X = StandardScaler().fit(concat_train[input_vars])
+        scaler_Y = StandardScaler().fit(concat_train[output_vars])
+
+        def standardize(dfs):
+            std_dfs = []
+            for df in dfs:
+                df_copy = df.copy()
+                df_copy[input_vars] = scaler_X.transform(df[input_vars])
+                df_copy[output_vars] = scaler_Y.transform(df[output_vars])
+                std_dfs.append(df_copy)
+            return std_dfs
+
+        std_train = standardize(train_dfs)
+        std_val = standardize(val_dfs)
+
+        X_train_list, Y_train_list = [], []
+        for df in std_train:
+            X, Y = construct_lagged_matrix(df, input_vars, output_vars, input_lag, output_lag)
+            if verify_lagging:
+                verify_lagged_matrix_construction(df, input_vars, output_vars, input_lag, output_lag)
+            X_train_list.append(X)
+            Y_train_list.append(Y)
+
+        X_val_list, Y_val_list = [], []
+        for df in std_val:
+            X, Y = construct_lagged_matrix(df, input_vars, output_vars, input_lag, output_lag)
+            if verify_lagging:
+                verify_lagged_matrix_construction(df, input_vars, output_vars, input_lag, output_lag)
+            X_val_list.append(X)
+            Y_val_list.append(Y)
+
+        X_train = torch.tensor(np.concatenate(X_train_list), dtype=torch.float32)
+        Y_train = torch.tensor(np.concatenate(Y_train_list), dtype=torch.float32)
+        X_val = torch.tensor(np.concatenate(X_val_list), dtype=torch.float32)
+        Y_val = torch.tensor(np.concatenate(Y_val_list), dtype=torch.float32)
+
+        train_dataset = TensorDataset(X_train, Y_train)
+        val_dataset = TensorDataset(X_val, Y_val)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=False, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=False, num_workers=0)
+
+        model = NARXNet(X_train.shape[1], Y_train.shape[1], hidden_units, num_layers).to(device)
+        criterion = torch.nn.MSELoss()
+        optimizer = OPTIMIZER_MAP[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        best_val_loss = float('inf')
+        epochs_no_improve = 0
+        best_model_state = None
+
+        print(f"Starting training fold {fold_idx} with up to {num_epochs} epochs (early stopping patience = {early_stopping_patience})", flush=True)
+
+        for epoch in range(1, num_epochs + 1):
+            model.train()
+            epoch_loss = 0.0
+            total_samples = 0
+
+            for X_batch, Y_batch in train_loader:
+                X_batch = X_batch.to(device)
+                Y_batch = Y_batch.to(device)
+
+                optimizer.zero_grad()
+                outputs = model(X_batch)
+                loss = criterion(outputs, Y_batch)
+                loss.backward()
+                optimizer.step()
+
+                batch_size_actual = X_batch.size(0)
+                epoch_loss += loss.item() * batch_size_actual
+                total_samples += batch_size_actual
+
+            avg_train_loss = epoch_loss / total_samples
+            if epoch % 5 == 0 or epoch == 1:
+                print(f"Epoch {epoch}/{num_epochs} - Train Loss: {avg_train_loss:.6f}", flush=True)
+
+            model.eval()
+            val_loss_accum = 0.0
+            val_samples = 0
+            with torch.no_grad():
+                for X_batch, Y_batch in val_loader:
+                    X_batch = X_batch.to(device)
+                    Y_batch = Y_batch.to(device)
+                    val_preds = model(X_batch)
+                    val_loss = criterion(val_preds, Y_batch)
+                    val_loss_accum += val_loss.item() * X_batch.size(0)
+                    val_samples += X_batch.size(0)
+            avg_val_loss = val_loss_accum / (val_samples + 1e-8)
+            if epoch % 5 == 0 or epoch == 1:
+                print(f"Epoch {epoch} - Validation Loss: {avg_val_loss:.6f}", flush=True)
+
+            if avg_val_loss < best_val_loss - 1e-6:
+                best_val_loss = avg_val_loss
+                epochs_no_improve = 0
+                best_model_state = model.state_dict()
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= early_stopping_patience:
+                    print(f"⏹️ Early stopping triggered at epoch {epoch} (no improvement in {early_stopping_patience} epochs)", flush=True)
+                    break
+
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+            model.eval()
+
+        train_loss_accum = 0.0
+        train_samples = 0
+        with torch.no_grad():
+            for X_batch, Y_batch in train_loader:
+                X_batch = X_batch.to(device)
+                Y_batch = Y_batch.to(device)
+                train_preds = model(X_batch)
+                batch_loss = criterion(train_preds, Y_batch)
+                train_loss_accum += batch_loss.item() * X_batch.size(0)
+                train_samples += X_batch.size(0)
+        final_train_loss = train_loss_accum / train_samples
+
+        print(f"Fold {fold_idx} final Train Loss (best model): {final_train_loss:.6f}", flush=True)
+        print(f"Fold {fold_idx} best Validation Loss: {best_val_loss:.6f}", flush=True)
+
+        fold_losses.append(best_val_loss)
+
+        del model, optimizer, train_loader, val_loader
+        gc.collect()
+
+    mean_val_loss = np.mean(fold_losses)
+    std_val_loss = np.std(fold_losses)
+    print(f"\n✅ Final CV Mean Loss: {mean_val_loss:.6f} ± {std_val_loss:.6f} (Std)", flush=True)
+
+    trial.set_user_attr("val_loss_std", float(std_val_loss))
+    trial.set_user_attr("val_loss_mean", float(mean_val_loss))
+
+    plt.figure(figsize=(6, 4))
+    plt.bar(range(1, len(fold_losses)+1), fold_losses)
+    plt.xlabel('Fold')
+    plt.ylabel('Best Validation Loss')
+    plt.title('Validation Loss per Fold')
+    plt.tight_layout()
+    plt.show()
+
+    return mean_val_loss
+
+def run_bo_on_clusters(resume=True, reset_study=False):
+    cluster_folders = list_cluster_folders(output_base)
+    storage_url = 'sqlite:///cluster_optimization.db'
+    max_trials = 10
+    summary = []
+
+    for cluster in cluster_folders:
+        print(f'\n🔍 Optimizing cluster: {cluster}')
+        cluster_path = os.path.join(output_base, cluster)
+
+        # Check if cluster folder exists, skip if not
+        if not os.path.exists(cluster_path):
+            print(f"⚠️ Cluster folder does not exist: {cluster_path}. Skipping this cluster.")
+            continue
+
+        study_name = f"{cluster}_optimization"
+
+        if reset_study:
+            try:
+                optuna.delete_study(study_name=study_name, storage=storage_url)
+                print(f"🧹 Deleted existing study: {study_name}")
+            except KeyError:
+                print(f"⚠️ No existing study found to delete: {study_name}")
+
+        sampler = TPESampler(seed=42)
+        study = optuna.create_study(
+            direction='minimize',
+            study_name=study_name,
+            storage=storage_url,
+            load_if_exists=True,
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10),
+            sampler=sampler
+        )
+
+        total_trials = len(study.trials)
+        completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        print(f"Total trials in study: {total_trials}")
+        print(f"Completed trials in study: {completed_trials}")
+        
+        if completed_trials > 0:
+            best_trial_info = {
+            'cluster': cluster,
+            'value': study.best_trial.value,
+            'params': study.best_trial.params,
+            'user_attrs': study.best_trial.user_attrs}
+
+            os.makedirs(cluster_path, exist_ok=True)
+            with open(os.path.join(cluster_path, 'best_trial.json'), 'w') as f:
+                json.dump(best_trial_info, f, indent=2)
+
+        if resume and completed_trials >= max_trials:
+            print(f"⏭️ Skipping {cluster} - already has {completed_trials} completed trials.")
+            continue
+
+        def objective(trial):
+            trial_seed = 42 + trial.number
+            return evaluate_model(cluster_path, trial, seed=trial_seed)
+
+        try:
+            n_trials_to_run = max_trials - completed_trials
+            if n_trials_to_run <= 0:
+                print(f"⚠️ No completed trials yet, but total trials reached max_trials. Re-running {max_trials} trials.")
+                n_trials_to_run = max_trials
+
+            study.optimize(objective, n_trials=n_trials_to_run, catch=(Exception,))
+        except Exception as e:
+            print(f"💥 Optimization for {cluster} failed unexpectedly:\n{e}")
+            continue
+
+        # Save best trial info and plot optimization history
+        try:
+            # Create cluster folder if somehow missing before saving
+
+            best_trial_info = {
+                'cluster': cluster,
+                'value': study.best_trial.value,
+                'params': study.best_trial.params,
+                'user_attrs': study.best_trial.user_attrs
+            }
+            with open(os.path.join(cluster_path, 'best_trial.json'), 'w') as f:
+                json.dump(best_trial_info, f, indent=2)
+
+            print(f"✅ Best trial for {cluster}: {study.best_trial.params}")
+            summary.append((cluster, study.best_value, study.best_trial.params))
+
+            # Plot optimization history
+            fig = vis.plot_optimization_history(study)
+            fig.figure.savefig(os.path.join(cluster_path, 'optimization_history.png'))
+            plt.close(fig.figure)
+
+        except ValueError:
+            print(f"⚠️ No completed trials found yet for cluster {cluster}. Skipping best trial summary.")
+            summary.append((cluster, None, None))
+        except Exception as e:
+            print(f"⚠️ Failed to save best trial or plot for cluster {cluster}: {e}")
+            summary.append((cluster, None, None))
+
+    print("\n📊 Optimization Summary")
+    for cluster, val, params in summary:
+        val_str = f"{val:.6e}" if val is not None else "N/A"
+        print(f"{cluster:<20} | Loss: {val_str} | Params: {params}")
+
+
+
+
+# ------------------ Step 4: Final Model Retraining and Evaluation on Test Set -------------------
+def print_metrics_table_scientific(mse_sums, mae_sums, output_vars, cluster_counts):
+    print("\n📊 Average Final Test MSE and MAE across all clusters (scientific notation):")
+    print(f"{'Output Variable':<12} | {'Avg MSE':>12} | {'Avg MAE':>12}")
+    print("-" * 41)
+    for var in output_vars:
+        avg_mse = mse_sums[var] / cluster_counts
+        avg_mae = mae_sums[var] / cluster_counts
+        print(f"{var:<12} | {avg_mse:.4e} | {avg_mae:.4e}")
+        
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Ensures deterministic behavior
+    torch.use_deterministic_algorithms(True)
+    # Disable benchmark to avoid nondeterministic algorithms
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+def step_4_train_and_test(cluster_folder, study_best_params, device='cpu', delete_old_ckpt=False, seed=42):
+    print(f"🚀 Starting Step 4: Final training and testing for {cluster_folder}")
+
+    # --- 1. Set seed for reproducibility ---
+    set_seed(seed)
+
+    # --- 2. Unpack hyperparameters ---
+    input_lag = study_best_params['input_lag']
+    output_lag = study_best_params['output_lag']
+    hidden_units = study_best_params['hidden_units']
+    num_layers = study_best_params['num_layers']
+    learning_rate = study_best_params['lr']
+    batch_size = study_best_params['batch_size']
+    num_epochs = study_best_params['epochs']
+    optimizer_name = study_best_params.get('optimizer', 'adam')
+    weight_decay = study_best_params.get('weight_decay', 0)
+
+    cluster_path = os.path.join(output_base, cluster_folder)
+    input_vars = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']
+    output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+
+    # --- 3. Load trainval and test files ---
+    trainval_files, test_files = get_trainval_test_files(cluster_path)
+
+    # --- 3b. Load all trainval files individually ---
+    trainval_dfs = [load_file(os.path.join(cluster_path, f)) for f in trainval_files]
+    test_dfs = [load_file(os.path.join(cluster_path, f)) for f in test_files]
+
+    # --- 4. Standardize data using trainval fit ---
+    # Concatenate trainval to fit scaler
+    concatenated_trainval = pd.concat(trainval_dfs, ignore_index=True)
+    scaler_X = StandardScaler().fit(concatenated_trainval[input_vars])
+    scaler_Y = StandardScaler().fit(concatenated_trainval[output_vars])
+
+    def standardize(df):
+        df_copy = df.copy()
+        df_copy[input_vars] = scaler_X.transform(df[input_vars])
+        df_copy[output_vars] = scaler_Y.transform(df[output_vars])
+        return df_copy
+
+    # Standardize each dataframe separately to keep structure
+    std_trainval_dfs = [standardize(df) for df in trainval_dfs]
+    std_test_dfs = [standardize(df) for df in test_dfs]
+
+    # --- 5. Construct lagged matrices PER FILE and concatenate ---
+    X_trainval_list = []
+    Y_trainval_list = []
+    for std_df in std_trainval_dfs:
+        X_tmp, Y_tmp = construct_lagged_matrix(std_df, input_vars, output_vars, input_lag, output_lag)
+        X_trainval_list.append(X_tmp)
+        Y_trainval_list.append(Y_tmp)
+    X_trainval = np.concatenate(X_trainval_list, axis=0)
+    Y_trainval = np.concatenate(Y_trainval_list, axis=0)
+
+    X_test_list = []
+    Y_test_list = []
+    for std_df in std_test_dfs:
+        X_tmp, Y_tmp = construct_lagged_matrix(std_df, input_vars, output_vars, input_lag, output_lag)
+        X_test_list.append(X_tmp)
+        Y_test_list.append(Y_tmp)
+    X_test = np.concatenate(X_test_list, axis=0)
+    Y_test = np.concatenate(Y_test_list, axis=0)
+
+    # --- 6. Prepare PyTorch datasets and loaders ---
+    train_dataset = TensorDataset(torch.tensor(X_trainval, dtype=torch.float32), torch.tensor(Y_trainval, dtype=torch.float32))
+    test_dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(Y_test, dtype=torch.float32))
+
+    g = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
+
+    # --- 7. Initialize model, loss, optimizer ---
+    model = NARXNet(X_trainval.shape[1], Y_trainval.shape[1], hidden_units, num_layers).to(device)
+    criterion = torch.nn.MSELoss()
+
+    if optimizer_name.lower() == 'adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name.lower() == 'sgd':
+        optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+    # --- 8. Training loop ---
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0
+        total_samples = 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            preds = model(xb)
+            loss = criterion(preds, yb)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * xb.size(0)
+        total_samples += len(train_loader.dataset)
+        avg_loss = epoch_loss / total_samples
+        print(f"📈 Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.6f}")
+
+    # --- 9. Evaluation on test set ---
+    model.eval()
+    with torch.no_grad():
+        X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+        Y_test_tensor = torch.tensor(Y_test, dtype=torch.float32).to(device)
+        Y_pred_tensor = model(X_test_tensor)
+        test_loss = criterion(Y_pred_tensor, Y_test_tensor).item()
+
+    # --- 10. Inverse transform predictions and ground truth ---
+    def inverse_transform(y_tensor):
+        if isinstance(y_tensor, torch.Tensor):
+            y_tensor = y_tensor.cpu().numpy()
+        return scaler_Y.inverse_transform(y_tensor)
+
+    Y_pred = inverse_transform(Y_pred_tensor)
+    Y_true = inverse_transform(Y_test_tensor)
+
+    print(f"\n✅ Final Test MSE for {cluster_folder}: {test_loss:.6f}")
+
+    # --- 11. Save model checkpoint ---
+    checkpoint_path = os.path.join(cluster_path, 'final_model.pt')
+    torch.save(model.state_dict(), checkpoint_path)
+    print(f"💾 Final model saved at: {checkpoint_path}")
+
+    if delete_old_ckpt:
+        old_ckpt_path = os.path.join(cluster_path, 'best_model.pt')
+        if os.path.exists(old_ckpt_path):
+            os.remove(old_ckpt_path)
+            print(f"🗑️ Old checkpoint {old_ckpt_path} removed.")
+
+    # --- 12. Plot actual vs predicted for first test file ---
+    single_test_path = os.path.join(cluster_path, test_files[0])
+    single_test_df = load_file(single_test_path)
+    single_test_std_df = standardize(single_test_df)
+    X_single_test, Y_single_test = construct_lagged_matrix(single_test_std_df, input_vars, output_vars, input_lag, output_lag)
+    X_single_tensor = torch.tensor(X_single_test, dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        Y_single_pred_tensor = model(X_single_tensor)
+
+    Y_single_true = inverse_transform(torch.tensor(Y_single_test, dtype=torch.float32))
+    Y_single_pred = inverse_transform(Y_single_pred_tensor)
+
+    time_steps = np.arange(Y_single_true.shape[0])
+
+    for i, out_var in enumerate(output_vars):
+        plt.figure(figsize=(10, 4))
+        plt.plot(time_steps, Y_single_pred[:, i], label='Predicted', color='blue')
+        plt.scatter(time_steps, Y_single_true[:, i], label='Actual', color='orange', s=15)
+        plt.title(f'{cluster_folder} - {out_var} trajectory')
+        plt.xlabel('Time step')
+        plt.ylabel(out_var)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plot_path = os.path.join(cluster_path, f'{out_var}_trajectory.png')
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"📊 Plot saved for {out_var} at {plot_path}")
+
+    # --- 13. Calculate metrics ---
+    mse_per_output = {}
+    mae_per_output = {}
+    for i, out_var in enumerate(output_vars):
+        mse_per_output[out_var] = mean_squared_error(Y_true[:, i], Y_pred[:, i])
+        mae_per_output[out_var] = mean_absolute_error(Y_true[:, i], Y_pred[:, i])
+
+    # --- 14. Return metrics ---
+    return mse_per_output, mae_per_output
+
+
+
+import os
+import json
+
+def run_step_4_on_all_clusters(device='cpu', delete_old_ckpt=False):
+    input_vars = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']
+    output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    cluster_folders = list_cluster_folders(output_base)
+
+    manual_best_params = {
+        'cluster_0_q98': {
+            'input_lag': 4,
+            'output_lag': 2,
+            'hidden_units': 36,
+            'num_layers': 2,
+            'lr': 0.0001530574436550019,
+            'batch_size': 64,
+            'num_epochs': 47,
+            'optimizer': 'adam',
+            'weight_decay': 9.323621351781485e-05
+        },
+        'cluster_1_q98': {
+            'input_lag': 2,
+            'output_lag': 5,
+            'hidden_units': 42,
+            'num_layers': 2,
+            'lr': 0.0001432249371823026,
+            'batch_size': 64,
+            'num_epochs': 38,
+            'optimizer': 'adam',
+            'weight_decay': 1.4321698289111523e-05
+        }
+    }
+
+    mse_sums = {var: 0.0 for var in output_vars}
+    mae_sums = {var: 0.0 for var in output_vars}
+    cluster_counts = 0
+
+    for cluster in cluster_folders:
+        cluster_path = os.path.join(output_base, cluster)
+        best_trial_path = os.path.join(cluster_path, 'best_trial.json')
+
+        best_params = None
+
+        # Try loading best_trial.json if exists
+        if os.path.isfile(best_trial_path):
+            try:
+                with open(best_trial_path, 'r') as f:
+                    data = json.load(f)
+                # Validate required keys
+                if 'params' in data:
+                    best_params = data['params']
+                    print(f"✅ Loaded best_trial.json params for cluster {cluster}.")
+                else:
+                    print(f"⚠️ best_trial.json found but missing 'params' key in cluster {cluster}.")
+            except Exception as e:
+                print(f"⚠️ Failed to load best_trial.json for cluster {cluster}: {e}")
+
+        # If loading failed or file missing, fallback to manual params if available
+        if best_params is None:
+            if cluster in manual_best_params:
+                best_params = manual_best_params[cluster]
+                print(f"ℹ️ Using manual best params for cluster {cluster}.")
+            else:
+                print(f"⚠️ No best params found for cluster {cluster}. Skipping Step 4.")
+                continue
+
+        print(f"\n🚀 Running Step 4 training/testing for cluster {cluster} with hyperparameters:")
+        print(best_params)
+
+        mse_per_output, mae_per_output = step_4_train_and_test(
+            cluster_folder=cluster,
+            study_best_params=best_params,
+            device=device,
+            delete_old_ckpt=delete_old_ckpt
+        )
+
+        for var in output_vars:
+            mse_sums[var] += mse_per_output[var]
+            mae_sums[var] += mae_per_output[var]
+
+        cluster_counts += 1
+
+    if cluster_counts > 0:
+        print_metrics_table_scientific(mse_sums, mae_sums, output_vars, cluster_counts)
+    else:
+        print("\n⚠️ No clusters were processed, so no average metrics to report.")
+
+    print("\n✅ All clusters processed for Step 4.")
+
+    
+if __name__ == '__main__':
+    run_bo_on_clusters()
+    run_step_4_on_all_clusters()
