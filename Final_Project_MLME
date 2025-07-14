@@ -1,0 +1,1586 @@
+import os
+import shutil
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from typing import List
+import random
+import gc
+import math
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+# ----------------- Load and Reshape Time Series -----------------
+folder_path = r'C:\Users\Mohammed Zubair Khan\Downloads\MLME\project_release\release\Data'
+files = sorted([f for f in os.listdir(folder_path) if f.endswith('.txt')])
+
+full_data_vectors = []
+file_names = []
+
+for file in files:
+    file_path = os.path.join(folder_path, file)
+    df = pd.read_csv(file_path, sep='\s+')
+
+    if df.shape != (1000, 13):
+        print(f"Skipping {file}: shape {df.shape} is invalid.")
+        continue
+
+    flattened = df.values.flatten()  # Shape: (13000,)
+    full_data_vectors.append(flattened)
+    file_names.append(file)
+
+X = np.stack(full_data_vectors)
+
+# ----------------- Scaling and PCA -----------------
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+pca_10d = PCA(n_components=10)
+X_pca_10 = pca_10d.fit_transform(X_scaled)
+
+pca_2d = PCA(n_components=2)
+X_pca_2 = pca_2d.fit_transform(X_scaled)
+
+# ----------------- KMeans Clustering -----------------
+kmeans = KMeans(n_clusters=2, random_state=42)
+kmeans_labels = kmeans.fit_predict(X_pca_10)
+
+# ----------------- Metrics -----------------
+def compute_metrics(X, labels):
+    if len(set(labels)) > 1:
+        sil = silhouette_score(X, labels)
+        db = davies_bouldin_score(X, labels)
+        ch = calinski_harabasz_score(X, labels)
+    else:
+        sil = db = ch = float('nan')
+    print(f"\nKMeans Clustering Metrics:")
+    print(f"Silhouette Score: {sil:.3f}")
+    print(f"Davies-Bouldin Index: {db:.3f}")
+    print(f"Calinski-Harabasz Score: {ch:.3f}")
+
+compute_metrics(X_pca_10, kmeans_labels)
+
+# ----------------- Save Clustering Results -----------------
+clustered_files = pd.DataFrame({'file': file_names, 'kmeans': kmeans_labels})
+
+# Create or reset output directories
+output_base = os.path.join(folder_path, 'clustered_output')
+os.makedirs(output_base, exist_ok=True)
+
+for cluster_id in [0, 1]:
+    cluster_dir = os.path.join(output_base, f'cluster_{cluster_id}')
+    if os.path.exists(cluster_dir):
+        shutil.rmtree(cluster_dir)
+    os.makedirs(cluster_dir)
+
+# Copy files to cluster folders
+for file, label in zip(file_names, kmeans_labels):
+    src_path = os.path.join(folder_path, file)
+    dst_folder = os.path.join(output_base, f'cluster_{label}')
+    shutil.copy2(src_path, dst_folder)
+
+# ----------------- Save File Lists -----------------
+for cluster_id in [0, 1]:
+    file_list = clustered_files[clustered_files.kmeans == cluster_id]['file'].tolist()
+    list_path = os.path.join(output_base, f'cluster_{cluster_id}_files.txt')
+    with open(list_path, 'w') as f:
+        for fname in file_list:
+            f.write(f"{fname}\n")
+
+# ----------------- Plotting K-means Results -----------------
+
+# Set up plotting style
+plt.style.use('default')
+sns.set_palette("husl")
+
+# Detailed 2D Visualization
+plt.figure(figsize=(12, 8))
+colors = ['#1f77b4', '#ff7f0e']
+
+# Add cluster centers (transform back to 2D space)
+kmeans_2d = KMeans(n_clusters=2, random_state=42)
+kmeans_2d.fit(X_pca_2)
+centers_2d = kmeans_2d.cluster_centers_
+
+for i, cluster_id in enumerate([0, 1]):
+    cluster_mask = kmeans_labels == cluster_id
+    plt.scatter(X_pca_2[cluster_mask, 0], X_pca_2[cluster_mask, 1], 
+               c=colors[i], label=f'Cluster {cluster_id}', alpha=0.6, s=60)
+
+# Plot centroids
+plt.scatter(centers_2d[:, 0], centers_2d[:, 1], c='red', marker='x', 
+           s=300, linewidths=4, label='Centroids')
+
+plt.xlabel('First Principal Component')
+plt.ylabel('Second Principal Component')
+plt.title('K-means Clustering Results (2D PCA Projection)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig(os.path.join(output_base, 'kmeans_2d_detailed.png'), 
+            dpi=300, bbox_inches='tight')
+plt.show()
+
+print(f"\nPlot saved to: {output_base}")
+print(f"- Detailed 2D plot: kmeans_2d_detailed.png")
+
+# ----------------- Preprocessing and Visualization for all Files -----------------
+
+# Define PSD variable names (update as needed)
+psd_vars = ['d50', 'd90', 'd10']  # Replace with actual PSD column names
+
+# Define q98 clipping
+def clip_q98(x):
+    q1, q99 = np.percentile(x, [1, 99])
+    return np.clip(x, q1, q99)
+
+# Create new directories for preprocessed PSD files
+psd_preprocessed_base = os.path.join(folder_path, 'preprocessed_psd_q98')
+os.makedirs(psd_preprocessed_base, exist_ok=True)
+
+for cluster_id in [0, 1]:
+    cluster_src_dir = os.path.join(output_base, f'cluster_{cluster_id}')
+    cluster_dst_dir = os.path.join(psd_preprocessed_base, f'cluster_{cluster_id}_q98')
+
+    if os.path.exists(cluster_dst_dir):
+        shutil.rmtree(cluster_dst_dir)
+    os.makedirs(cluster_dst_dir)
+
+    file_list = sorted([f for f in os.listdir(cluster_src_dir) if f.endswith('.txt')])
+
+    for fname in file_list:
+        fpath = os.path.join(cluster_src_dir, fname)
+        df = pd.read_csv(fpath, sep='\s+')
+
+        for var in psd_vars:
+            if var in df.columns:
+                df[var] = clip_q98(df[var].values)
+
+        df.to_csv(os.path.join(cluster_dst_dir, fname), sep='\t', index=False)
+
+print("Preprocessed PSD files saved into separate q98 folders for each cluster.")
+
+# ---------------------------- Configuration ----------------------------
+script_dir = os.path.dirname(os.path.abspath(__file__))
+output_base = os.path.join(script_dir, 'preprocessed_psd_q98')  # Path to preprocessed clusters
+
+# --------------------- Step 1A: Generate file lists ---------------------
+print("🔍 Creating file lists for each cluster...")
+
+for cluster_name in os.listdir(output_base):
+    cluster_dir = os.path.join(output_base, cluster_name)
+    if not os.path.isdir(cluster_dir) or not cluster_name.startswith("cluster_"):
+        continue
+
+    list_path = os.path.join(output_base, f"{cluster_name}_files.txt")
+    if os.path.exists(list_path) and os.path.getsize(list_path) > 0:
+        print(f"✅ {cluster_name}_files.txt already exists and is non-empty. Skipping.")
+        continue
+
+    file_list = [
+        fname for fname in os.listdir(cluster_dir)
+        if fname.endswith(".txt")
+    ]
+
+    with open(list_path, 'w') as f:
+        f.writelines(f"{fname}\n" for fname in sorted(file_list))
+
+    print(f"📄 {cluster_name}_files.txt created with {len(file_list)} files.")
+
+# ------------------ Step 1B: Shuffle and split files -------------------
+print("\n🔀 Splitting files into trainval/test sets...")
+
+test_ratio = 0.15  # 15% for testing
+
+for cluster_name in os.listdir(output_base):
+    cluster_dir = os.path.join(output_base, cluster_name)
+    if not os.path.isdir(cluster_dir) or not cluster_name.startswith("cluster_"):
+        continue
+
+    file_list_path = os.path.join(output_base, f"{cluster_name}_files.txt")
+    if not os.path.exists(file_list_path):
+        raise FileNotFoundError(f"Missing file list: {file_list_path}")
+
+    with open(file_list_path, 'r') as f:
+        all_files = [line.strip() for line in f if line.strip()]
+
+    rng = random.Random(42)
+    rng.shuffle(all_files)
+    num_test = max(1, int(len(all_files) * test_ratio))
+    test_files = all_files[:num_test]
+    trainval_files = all_files[num_test:]
+
+    with open(os.path.join(cluster_dir, 'test_files.txt'), 'w') as f:
+        f.writelines(f"{fname}\n" for fname in test_files)
+
+    with open(os.path.join(cluster_dir, 'trainval_files.txt'), 'w') as f:
+        f.writelines(f"{fname}\n" for fname in trainval_files)
+
+    print(f"✅ {cluster_name}: {len(trainval_files)} trainval, {len(test_files)} test files saved.")
+
+print("\n🎉 All file lists and splits created successfully!")
+
+# ---------------------- Utility Functions (FIXED) ----------------------
+def load_file(file_path):
+    """Load file with error handling and validation"""
+    try:
+        df = pd.read_csv(file_path, sep='\t')
+        if df.empty:
+            print(f"Warning: Empty file {file_path}")
+            return None
+        return df
+    except Exception as e:
+        print(f"Error loading file {file_path}: {e}")
+        return None
+
+def list_cluster_folders(base_path):
+    """List cluster folders with validation"""
+    if not os.path.exists(base_path):
+        print(f"Warning: Base path {base_path} does not exist")
+        return []
+    return sorted([f for f in os.listdir(base_path) if f.startswith('cluster_') and f.endswith('_q98')])
+
+def get_trainval_test_files(cluster_folder):
+    """Get train/test files with error handling"""
+    trainval_path = os.path.join(cluster_folder, 'trainval_files.txt')
+    test_path = os.path.join(cluster_folder, 'test_files.txt')
+    
+    trainval = []
+    test = []
+    
+    if os.path.exists(trainval_path):
+        with open(trainval_path) as f:
+            trainval = [line.strip() for line in f if line.strip()]
+    
+    if os.path.exists(test_path):
+        with open(test_path) as f:
+            test = [line.strip() for line in f if line.strip()]
+    
+    return trainval, test
+
+def construct_lagged_matrix(df, input_vars, output_vars, input_lag, output_lag):
+    """Construct lagged matrix with enhanced error handling"""
+    # Validate inputs
+    if df is None or df.empty:
+        print("Warning: Empty dataframe passed to construct_lagged_matrix")
+        return np.array([]), np.array([])
+    
+    # Check if required columns exist
+    missing_input = [var for var in input_vars if var not in df.columns]
+    missing_output = [var for var in output_vars if var not in df.columns]
+    
+    if missing_input:
+        print(f"Warning: Missing input variables: {missing_input}")
+        return np.array([]), np.array([])
+    
+    if missing_output:
+        print(f"Warning: Missing output variables: {missing_output}")
+        return np.array([]), np.array([])
+    
+    # Check for sufficient data length
+    max_lag = max(input_lag, output_lag)
+    if len(df) <= max_lag:
+        print(f"Warning: Insufficient data length {len(df)} for max_lag {max_lag}")
+        return np.array([]), np.array([])
+    
+    X, Y = [], []
+    
+    try:
+        for t in range(max_lag, len(df)):
+            x_t = []
+
+            # First: output lags (t-1 to t-output_lag)
+            for lag in range(1, output_lag + 1):
+                if t - lag >= 0:
+                    x_t.extend(df[output_vars].iloc[t - lag].values)
+                else:
+                    x_t.extend([np.nan] * len(output_vars))
+
+            # Then: input lags (t-1 to t-input_lag)
+            for lag in range(1, input_lag + 1):
+                if t - lag >= 0:
+                    x_t.extend(df[input_vars].iloc[t - lag].values)
+                else:
+                    x_t.extend([np.nan] * len(input_vars))
+
+            # Target at time t (not lagged)
+            y_t = df[output_vars].iloc[t].values
+
+            # Skip if any NaN values
+            if not (np.isnan(x_t).any() or np.isnan(y_t).any()):
+                X.append(x_t)
+                Y.append(y_t)
+
+        return np.array(X), np.array(Y)
+    
+    except Exception as e:
+        print(f"Error in construct_lagged_matrix: {e}")
+        return np.array([]), np.array([])
+
+# ---------------------- Neural Network (FIXED) ----------------------
+class NARXNet(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_units, num_layers, dropout=0.1):
+        super().__init__()
+        layers = []
+        in_dim = input_dim
+        
+        for i in range(num_layers):
+            layers.append(nn.Linear(in_dim, hidden_units))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_units
+        
+        layers.append(nn.Linear(in_dim, output_dim))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+# ---------------------- Quantile Loss Functions (FIXED) ----------------------
+class QuantileLoss(nn.Module):
+    def __init__(self, quantile):
+        super().__init__()
+        self.quantile = quantile
+
+    def forward(self, pred, target):
+        # Handle NaN values
+        mask = ~(torch.isnan(pred) | torch.isnan(target))
+        if mask.sum() == 0:
+            return torch.tensor(0.0, requires_grad=True)
+        
+        pred_masked = pred[mask]
+        target_masked = target[mask]
+        
+        error = target_masked - pred_masked
+        loss = torch.where(error >= 0, 
+                          self.quantile * error, 
+                          (self.quantile - 1) * error)
+        return loss.mean()
+
+# ---------------------- FIXED: Conformal Prediction Pipeline ----------------------
+
+def set_seed(seed=42):
+    """Set random seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    # Use deterministic algorithms where possible
+    try:
+        torch.use_deterministic_algorithms(True)
+    except:
+        pass  # Some PyTorch versions don't support this
+    
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+def step_1_generate_predictions(cluster_folder, study_best_params, device='cpu', seed=42):
+    """
+    Step 1: Generate y_pred for each file and save enhanced files with predictions
+    FIXED: Better error handling and validation
+    """
+    print(f"🔮 Step 1: Generating predictions for {cluster_folder}")
+    
+    set_seed(seed)
+    
+    # Unpack hyperparameters with defaults
+    input_lag = study_best_params.get('input_lag', 3)
+    output_lag = study_best_params.get('output_lag', 2)
+    hidden_units = study_best_params.get('hidden_units', 64)
+    num_layers = study_best_params.get('num_layers', 3)
+    learning_rate = study_best_params.get('lr', 0.001)
+    batch_size = study_best_params.get('batch_size', 32)
+    num_epochs = study_best_params.get('num_epochs', 100)
+    optimizer_name = study_best_params.get('optimizer', 'adam')
+    weight_decay = study_best_params.get('weight_decay', 0)
+
+    cluster_path = os.path.join(output_base, cluster_folder)
+    
+    if not os.path.exists(cluster_path):
+        print(f"Error: Cluster path {cluster_path} does not exist")
+        return None
+    
+    input_vars = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']
+    output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+
+    # Load all files with error handling
+    all_files = [f for f in os.listdir(cluster_path) if f.endswith('.txt') and not f.endswith('_files.txt')]
+    
+    if not all_files:
+        print(f"Error: No data files found in {cluster_path}")
+        return None
+    
+    all_dfs = []
+    valid_files = []
+    
+    for f in all_files:
+        df = load_file(os.path.join(cluster_path, f))
+        if df is not None and not df.empty:
+            all_dfs.append(df)
+            valid_files.append(f)
+    
+    if not all_dfs:
+        print("Error: No valid data files found")
+        return None
+    
+    print(f"Loaded {len(all_dfs)} valid files out of {len(all_files)}")
+
+    # Fit scalers on all data
+    try:
+        concatenated_all = pd.concat(all_dfs, ignore_index=True)
+        
+        # Check if required columns exist
+        missing_input = [var for var in input_vars if var not in concatenated_all.columns]
+        missing_output = [var for var in output_vars if var not in concatenated_all.columns]
+        
+        if missing_input or missing_output:
+            print(f"Error: Missing variables - Input: {missing_input}, Output: {missing_output}")
+            return None
+        
+        # Remove NaN values before fitting scalers
+        concatenated_clean = concatenated_all.dropna(subset=input_vars + output_vars)
+        
+        if concatenated_clean.empty:
+            print("Error: No valid data after removing NaN values")
+            return None
+        
+        scaler_X = StandardScaler().fit(concatenated_clean[input_vars])
+        scaler_Y = StandardScaler().fit(concatenated_clean[output_vars])
+        
+    except Exception as e:
+        print(f"Error fitting scalers: {e}")
+        return None
+
+    def standardize(df):
+        """Standardize dataframe with error handling"""
+        try:
+            df_copy = df.copy()
+            df_copy[input_vars] = scaler_X.transform(df[input_vars])
+            df_copy[output_vars] = scaler_Y.transform(df[output_vars])
+            return df_copy
+        except Exception as e:
+            print(f"Error in standardization: {e}")
+            return None
+
+    # Standardize all dataframes
+    std_all_dfs = []
+    for df in all_dfs:
+        std_df = standardize(df)
+        if std_df is not None:
+            std_all_dfs.append(std_df)
+    
+    if not std_all_dfs:
+        print("Error: No valid standardized dataframes")
+        return None
+
+    # Create lagged matrices for training
+    X_all_list = []
+    Y_all_list = []
+    
+    for std_df in std_all_dfs:
+        X_tmp, Y_tmp = construct_lagged_matrix(std_df, input_vars, output_vars, input_lag, output_lag)
+        if len(X_tmp) > 0 and len(Y_tmp) > 0:
+            X_all_list.append(X_tmp)
+            Y_all_list.append(Y_tmp)
+    
+    if not X_all_list:
+        print("Error: No valid lagged matrices generated")
+        return None
+    
+    X_all = np.concatenate(X_all_list, axis=0)
+    Y_all = np.concatenate(Y_all_list, axis=0)
+    
+    print(f"Training data shape: X={X_all.shape}, Y={Y_all.shape}")
+
+    # Train model
+    try:
+        model = NARXNet(X_all.shape[1], Y_all.shape[1], hidden_units, num_layers).to(device)
+        criterion = torch.nn.MSELoss()
+        
+        if optimizer_name.lower() == 'adam':
+            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        else:
+            optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+        # Training with error handling
+        train_dataset = TensorDataset(torch.tensor(X_all, dtype=torch.float32), 
+                                    torch.tensor(Y_all, dtype=torch.float32))
+        g = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
+
+        model.train()
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            for xb, yb in train_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                
+                # Skip batch if contains NaN
+                if torch.isnan(xb).any() or torch.isnan(yb).any():
+                    continue
+                
+                optimizer.zero_grad()
+                preds = model(xb)
+                loss = criterion(preds, yb)
+                
+                if torch.isnan(loss):
+                    continue
+                
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            
+            if (epoch + 1) % 20 == 0:
+                print(f"  Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+
+    except Exception as e:
+        print(f"Error during training: {e}")
+        return None
+
+    # Generate predictions for each file
+    enhanced_files_dir = os.path.join(cluster_path, 'enhanced_files')
+    os.makedirs(enhanced_files_dir, exist_ok=True)
+
+    model.eval()
+    with torch.no_grad():
+        for i, (fname, df, std_df) in enumerate(zip(valid_files, all_dfs, std_all_dfs)):
+            try:
+                X_file, Y_file = construct_lagged_matrix(std_df, input_vars, output_vars, input_lag, output_lag)
+                
+                if len(X_file) == 0:
+                    print(f"Warning: No valid data for predictions in {fname}")
+                    continue
+                
+                X_file_tensor = torch.tensor(X_file, dtype=torch.float32).to(device)
+                Y_pred_tensor = model(X_file_tensor)
+                
+                # Inverse transform predictions
+                Y_pred = scaler_Y.inverse_transform(Y_pred_tensor.cpu().numpy())
+                
+                # Create enhanced dataframe
+                enhanced_df = df.copy()
+                max_lag = max(input_lag, output_lag)
+                
+                # Add y_pred columns (padded with NaN for initial timesteps)
+                for j, var in enumerate(output_vars):
+                    pred_col = f"{var}_pred"
+                    enhanced_df[pred_col] = np.nan
+                    if len(Y_pred) > 0:
+                        enhanced_df[pred_col].iloc[max_lag:max_lag+len(Y_pred)] = Y_pred[:, j]
+                
+                # Save enhanced file
+                enhanced_path = os.path.join(enhanced_files_dir, fname)
+                enhanced_df.to_csv(enhanced_path, sep='\t', index=False)
+
+            except Exception as e:
+                print(f"Error processing file {fname}: {e}")
+                continue
+    
+    print(f"✅ Enhanced files with predictions saved to {enhanced_files_dir}")
+    return enhanced_files_dir
+
+def step_2_new_data_splits(cluster_folder, enhanced_files_dir, seed=42):
+    """
+    Step 2: Split enhanced files into train/cal/test (70/10/20)
+    FIXED: Better error handling and validation
+    """
+    print(f"🔀 Step 2: Creating new data splits for {cluster_folder}")
+    
+    if not os.path.exists(enhanced_files_dir):
+        print(f"Error: Enhanced files directory {enhanced_files_dir} does not exist")
+        return None
+    
+    cluster_path = os.path.join(output_base, cluster_folder)
+    
+    # Get all enhanced files
+    all_files = [f for f in os.listdir(enhanced_files_dir) if f.endswith('.txt')]
+    
+    if not all_files:
+        print(f"Error: No enhanced files found in {enhanced_files_dir}")
+        return None
+    
+    # Shuffle and split
+    rng = random.Random(seed)
+    rng.shuffle(all_files)
+    
+    n_files = len(all_files)
+    n_train = max(1, int(0.7 * n_files))
+    n_cal = max(1, int(0.1 * n_files))
+    
+    train_files = all_files[:n_train]
+    cal_files = all_files[n_train:n_train + n_cal]
+    test_files = all_files[n_train + n_cal:]
+    
+    # Ensure we have at least one file in each split
+    if not train_files:
+        print("Error: No training files")
+        return None
+    
+    if not cal_files and n_files > 1:
+        # Move one file from training to calibration
+        cal_files = [train_files.pop()]
+    
+    if not test_files and n_files > 2:
+        # Move one file from training to test
+        test_files = [train_files.pop()]
+    
+    # Create split directories
+    splits_dir = os.path.join(cluster_path, 'conformal_splits')
+    os.makedirs(splits_dir, exist_ok=True)
+    
+    try:
+        for split_name, file_list in [('train', train_files), ('cal', cal_files), ('test', test_files)]:
+            if not file_list:
+                print(f"Warning: No files for {split_name} split")
+                continue
+            
+            split_dir = os.path.join(splits_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            
+            # Copy files to split directory
+            for fname in file_list:
+                src = os.path.join(enhanced_files_dir, fname)
+                dst = os.path.join(split_dir, fname)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+            
+            # Save file list
+            list_path = os.path.join(splits_dir, f'{split_name}_files.txt')
+            with open(list_path, 'w') as f:
+                for fname in file_list:
+                    f.write(f"{fname}\n")
+        
+        print(f"✅ Split created: {len(train_files)} train, {len(cal_files)} cal, {len(test_files)} test")
+        return splits_dir
+        
+    except Exception as e:
+        print(f"Error creating splits: {e}")
+        return None
+
+def step_3_standardize_with_global_stats(cluster_folder, splits_dir):
+    """
+    Step 3: Standardize all splits using training set statistics
+    FIXED: Better error handling and validation for missing columns
+    """
+    print(f"📊 Step 3: Standardizing with global training statistics for {cluster_folder}")
+    
+    if not os.path.exists(splits_dir):
+        print(f"Error: Splits directory {splits_dir} does not exist")
+        return None, None
+    
+    input_vars = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal']
+    output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    
+    # Load training files to compute global statistics
+    train_dir = os.path.join(splits_dir, 'train')
+    
+    if not os.path.exists(train_dir):
+        print(f"Error: Training directory {train_dir} does not exist")
+        return None, None
+    
+    train_files = [f for f in os.listdir(train_dir) if f.endswith('.txt')]
+    
+    if not train_files:
+        print(f"Error: No training files found in {train_dir}")
+        return None, None
+    
+    # Load and concatenate training data
+    train_dfs = []
+    for f in train_files:
+        df = load_file(os.path.join(train_dir, f))
+        if df is not None and not df.empty:
+            train_dfs.append(df)
+    
+    if not train_dfs:
+        print("Error: No valid training data loaded")
+        return None, None
+    
+    try:
+        # Compute global statistics from training data
+        train_concat = pd.concat(train_dfs, ignore_index=True)
+        
+        # Check for required columns
+        missing_input = [var for var in input_vars if var not in train_concat.columns]
+        missing_output = [var for var in output_vars if var not in train_concat.columns]
+        
+        if missing_input or missing_output:
+            print(f"Error: Missing variables - Input: {missing_input}, Output: {missing_output}")
+            return None, None
+        
+        # Remove NaN values before fitting scalers
+        train_clean = train_concat.dropna(subset=input_vars + output_vars)
+        
+        if train_clean.empty:
+            print("Error: No valid training data after removing NaN values")
+            return None, None
+        
+        # Fit scalers
+        input_scaler = StandardScaler().fit(train_clean[input_vars])
+        output_scaler = StandardScaler().fit(train_clean[output_vars])
+        
+        scalers = {
+            'input_scaler': input_scaler,
+            'output_scaler': output_scaler
+        }
+        
+    except Exception as e:
+        print(f"Error fitting scalers: {e}")
+        return None, None
+    
+    # Standardize all splits
+    standardized_dir = os.path.join(os.path.dirname(splits_dir), 'standardized_splits')
+    os.makedirs(standardized_dir, exist_ok=True)
+    
+    # Continue standardizing all splits
+    for split_name in ['train', 'cal', 'test']:
+        split_src_dir = os.path.join(splits_dir, split_name)
+        split_dst_dir = os.path.join(standardized_dir, split_name)
+        
+        if not os.path.exists(split_src_dir):
+            print(f"Warning: Split directory {split_src_dir} does not exist")
+            continue
+        
+        os.makedirs(split_dst_dir, exist_ok=True)
+        
+        split_files = [f for f in os.listdir(split_src_dir) if f.endswith('.txt')]
+        
+        for fname in split_files:
+            try:
+                df = load_file(os.path.join(split_src_dir, fname))
+                if df is None or df.empty:
+                    continue
+                
+                # Debug: Print actual column names
+                print(f"Processing {fname}")
+                print(f"Columns in file: {list(df.columns)}")
+                print(f"Expected output vars: {output_vars}")
+                
+                # Check if file has all required output variables
+                missing_outputs = [var for var in output_vars if var not in df.columns]
+                
+                if missing_outputs:
+                    print(f"❌ {fname}: Missing output variables {missing_outputs}")
+                    continue
+                
+                # Standardize input and output variables
+                df_std = df.copy()
+                
+                # Check if columns exist before standardizing
+                available_input = [var for var in input_vars if var in df.columns]
+                
+                if available_input:
+                    df_std[available_input] = input_scaler.transform(df[available_input])
+                
+                # For output variables, ensure we have ALL required variables
+                if all(var in df.columns for var in output_vars):
+                    try:
+                        df_std[output_vars] = output_scaler.transform(df[output_vars])
+                        print(f"✅ {fname}: Successfully standardized")
+                    except Exception as e:
+                        print(f"❌ {fname}: Error during output standardization: {e}")
+                        continue
+                else:
+                    available_outputs = [var for var in output_vars if var in df.columns]
+                    print(f"❌ {fname}: Missing some output variables.")
+                    print(f"   Available: {available_outputs}")
+                    print(f"   Missing: {[var for var in output_vars if var not in df.columns]}")
+                    continue
+                
+                # Also standardize prediction columns if they exist
+                pred_cols = [col for col in df.columns if col.endswith('_pred')]
+                for pred_col in pred_cols:
+                    base_var = pred_col.replace('_pred', '')
+                    if base_var in output_vars:
+                        # Create a temporary dataframe with all output variables for transformation
+                        temp_df = pd.DataFrame(0, index=df.index, columns=output_vars)
+                        temp_df[base_var] = df[pred_col]
+                        
+                        # Transform and extract the specific variable
+                        transformed = output_scaler.transform(temp_df)
+                        var_idx = output_vars.index(base_var)
+                        df_std[pred_col] = transformed[:, var_idx]
+                
+                # Save standardized file
+                df_std.to_csv(os.path.join(split_dst_dir, fname), sep='\t', index=False)
+                
+            except Exception as e:
+                print(f"Error standardizing file {fname}: {e}")
+                continue
+    
+    print(f"✅ Standardized splits saved to {standardized_dir}")
+    return standardized_dir, scalers
+
+def step_4_compute_nonconformity_scores(cluster_folder, standardized_dir, scalers):
+    """
+    Step 4: Compute nonconformity scores on calibration set
+    FIXED: Better error handling and validation
+    """
+    print(f"📏 Step 4: Computing nonconformity scores for {cluster_folder}")
+    
+    if not os.path.exists(standardized_dir):
+        print(f"Error: Standardized directory {standardized_dir} does not exist")
+        return None
+    
+    cal_dir = os.path.join(standardized_dir, 'cal')
+    
+    if not os.path.exists(cal_dir):
+        print(f"Error: Calibration directory {cal_dir} does not exist")
+        return None
+    
+    cal_files = [f for f in os.listdir(cal_dir) if f.endswith('.txt')]
+    
+    if not cal_files:
+        print(f"Error: No calibration files found in {cal_dir}")
+        return None
+    
+    output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    all_scores = []
+    
+    # Compute nonconformity scores for each calibration file
+    for fname in cal_files:
+        try:
+            df = load_file(os.path.join(cal_dir, fname))
+            if df is None or df.empty:
+                continue
+            
+            # Check if prediction columns exist
+            pred_cols = [f"{var}_pred" for var in output_vars]
+            available_pred_cols = [col for col in pred_cols if col in df.columns]
+            
+            if not available_pred_cols:
+                print(f"Warning: No prediction columns found in {fname}")
+                continue
+            
+            # Extract actual and predicted values
+            for var in output_vars:
+                actual_col = var
+                pred_col = f"{var}_pred"
+                
+                if actual_col in df.columns and pred_col in df.columns:
+                    # Remove NaN values
+                    mask = ~(df[actual_col].isna() | df[pred_col].isna())
+                    if mask.sum() == 0:
+                        continue
+                    
+                    actual = df[actual_col][mask].values
+                    predicted = df[pred_col][mask].values
+                    
+                    # Compute absolute residuals as nonconformity scores
+                    scores = np.abs(actual - predicted)
+                    all_scores.extend(scores)
+        
+        except Exception as e:
+            print(f"Error processing calibration file {fname}: {e}")
+            continue
+    
+    if not all_scores:
+        print("Error: No nonconformity scores computed")
+        return None
+    
+    all_scores = np.array(all_scores)
+    
+    # Save nonconformity scores
+    scores_path = os.path.join(os.path.dirname(standardized_dir), 'nonconformity_scores.npy')
+    np.save(scores_path, all_scores)
+    
+    print(f"✅ Computed {len(all_scores)} nonconformity scores")
+    print(f"   Mean: {np.mean(all_scores):.4f}, Std: {np.std(all_scores):.4f}")
+    print(f"   Min: {np.min(all_scores):.4f}, Max: {np.max(all_scores):.4f}")
+    
+    return all_scores
+
+def step_5_conformal_prediction(cluster_folder, standardized_dir, nonconformity_scores, alpha=0.1):
+    """
+    Step 5: Apply conformal prediction to test set
+    FIXED: Better error handling and validation
+    """
+    print(f"🔮 Step 5: Applying conformal prediction for {cluster_folder}")
+    
+    if not os.path.exists(standardized_dir):
+        print(f"Error: Standardized directory {standardized_dir} does not exist")
+        return None
+    
+    if nonconformity_scores is None or len(nonconformity_scores) == 0:
+        print("Error: No nonconformity scores provided")
+        return None
+    
+    test_dir = os.path.join(standardized_dir, 'test')
+    
+    if not os.path.exists(test_dir):
+        print(f"Error: Test directory {test_dir} does not exist")
+        return None
+    
+    test_files = [f for f in os.listdir(test_dir) if f.endswith('.txt')]
+    
+    if not test_files:
+        print(f"Error: No test files found in {test_dir}")
+        return None
+    
+    # Compute quantile threshold
+    n_cal = len(nonconformity_scores)
+    q_level = np.ceil((n_cal + 1) * (1 - alpha)) / n_cal
+    q_level = min(q_level, 1.0)  # Ensure it doesn't exceed 1
+    
+    threshold = np.quantile(nonconformity_scores, q_level)
+    print(f"📊 Confidence level: {(1-alpha)*100}%, Threshold: {threshold:.4f}")
+    
+    output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    
+    # Apply conformal prediction to test files
+    results_dir = os.path.join(os.path.dirname(standardized_dir), 'conformal_results')
+    os.makedirs(results_dir, exist_ok=True)
+    
+    coverage_stats = []
+    
+    for fname in test_files:
+        try:
+            df = load_file(os.path.join(test_dir, fname))
+            if df is None or df.empty:
+                continue
+            
+            # Create results dataframe
+            results_df = df.copy()
+            
+            # Add prediction intervals for each output variable
+            for var in output_vars:
+                pred_col = f"{var}_pred"
+                
+                if pred_col in df.columns:
+                    # Create prediction intervals
+                    lower_col = f"{var}_lower"
+                    upper_col = f"{var}_upper"
+                    
+                    results_df[lower_col] = df[pred_col] - threshold
+                    results_df[upper_col] = df[pred_col] + threshold
+                    
+                    # Compute coverage if actual values are available
+                    if var in df.columns:
+                        actual = df[var]
+                        lower = results_df[lower_col]
+                        upper = results_df[upper_col]
+                        
+                        # Remove NaN values for coverage calculation
+                        mask = ~(actual.isna() | lower.isna() | upper.isna())
+                        if mask.sum() > 0:
+                            coverage = ((actual[mask] >= lower[mask]) & 
+                                      (actual[mask] <= upper[mask])).mean()
+                            coverage_stats.append({
+                                'file': fname,
+                                'variable': var,
+                                'coverage': coverage,
+                                'n_points': mask.sum()
+                            })
+            
+            # Save results
+            results_path = os.path.join(results_dir, f"conformal_{fname}")
+            results_df.to_csv(results_path, sep='\t', index=False)
+            
+        except Exception as e:
+            print(f"Error processing test file {fname}: {e}")
+            continue
+    
+    # Compute overall coverage statistics
+    if coverage_stats:
+        coverage_df = pd.DataFrame(coverage_stats)
+        
+        # Overall coverage by variable
+        var_coverage = coverage_df.groupby('variable')['coverage'].agg(['mean', 'std', 'count'])
+        print("\n📈 Coverage Statistics by Variable:")
+        print(var_coverage.round(3))
+        
+        # Overall coverage across all variables
+        overall_coverage = coverage_df['coverage'].mean()
+        print(f"\n🎯 Overall Coverage: {overall_coverage:.3f} (Target: {1-alpha:.3f})")
+        
+        # Save coverage statistics
+        coverage_path = os.path.join(results_dir, 'coverage_stats.csv')
+        coverage_df.to_csv(coverage_path, index=False)
+        
+        var_coverage_path = os.path.join(results_dir, 'variable_coverage.csv')
+        var_coverage.to_csv(var_coverage_path)
+    
+    print(f"✅ Conformal prediction results saved to {results_dir}")
+    return results_dir
+
+def run_conformal_pipeline(cluster_folder, study_best_params, alpha=0.1, device='cpu', seed=42):
+    """
+    Run the complete conformal prediction pipeline
+    """
+    print(f"\n🚀 Running Conformal Prediction Pipeline for {cluster_folder}")
+    print(f"   Confidence Level: {(1-alpha)*100}%")
+    print(f"   Device: {device}")
+    print(f"   Seed: {seed}")
+    
+    try:
+        # Step 1: Generate predictions
+        enhanced_files_dir = step_1_generate_predictions(cluster_folder, study_best_params, device, seed)
+        if enhanced_files_dir is None:
+            print("❌ Pipeline failed at Step 1")
+            return None
+        
+        # Step 2: Create new data splits
+        splits_dir = step_2_new_data_splits(cluster_folder, enhanced_files_dir, seed)
+        if splits_dir is None:
+            print("❌ Pipeline failed at Step 2")
+            return None
+        
+        # Step 3: Standardize with global statistics
+        standardized_dir, scalers = step_3_standardize_with_global_stats(cluster_folder, splits_dir)
+        if standardized_dir is None:
+            print("❌ Pipeline failed at Step 3")
+            return None
+        
+        # Step 4: Compute nonconformity scores
+        nonconformity_scores = step_4_compute_nonconformity_scores(cluster_folder, standardized_dir, scalers)
+        if nonconformity_scores is None:
+            print("❌ Pipeline failed at Step 4")
+            return None
+        
+        # Step 5: Apply conformal prediction
+        results_dir = step_5_conformal_prediction(cluster_folder, standardized_dir, nonconformity_scores, alpha)
+        if results_dir is None:
+            print("❌ Pipeline failed at Step 5")
+            return None
+        
+        print(f"✅ Conformal prediction pipeline completed successfully!")
+        analyze_conformal_results(results_dir)
+        return results_dir
+        
+    except Exception as e:
+        print(f"❌ Pipeline failed with error: {e}")
+        return None
+# ---------------------- Utility Functions for Analysis ----------------------
+
+def analyze_conformal_results(results_dir):
+    """
+    Analyze conformal prediction results
+    """
+    if not os.path.exists(results_dir):
+        print(f"Results directory {results_dir} does not exist")
+        return
+    
+    # Load coverage statistics
+    coverage_stats_path = os.path.join(results_dir, 'coverage_stats.csv')
+    var_coverage_path = os.path.join(results_dir, 'variable_coverage.csv')
+    
+    if os.path.exists(coverage_stats_path):
+        coverage_stats = pd.read_csv(coverage_stats_path)
+        print("\n📊 Detailed Coverage Statistics:")
+        print(coverage_stats.head())
+    
+    if os.path.exists(var_coverage_path):
+        var_coverage = pd.read_csv(var_coverage_path)
+        print("\n📈 Variable Coverage Summary:")
+        print(var_coverage)
+    
+    # Visualize results if matplotlib is available
+    try:
+        import matplotlib.pyplot as plt
+        
+        if os.path.exists(coverage_stats_path):
+            coverage_stats = pd.read_csv(coverage_stats_path)
+            
+            # Coverage by variable
+            plt.figure(figsize=(10, 6))
+            coverage_by_var = coverage_stats.groupby('variable')['coverage'].mean()
+            coverage_by_var.plot(kind='bar')
+            plt.title('Coverage by Variable')
+            plt.ylabel('Coverage')
+            plt.xlabel('Variable')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            
+            # Save plot
+            plot_path = os.path.join(results_dir, 'coverage_by_variable.png')
+            plt.savefig(plot_path)
+            print(f"📊 Coverage plot saved to {plot_path}")
+            plt.close()
+            plot_conformal_predictions_subplots(results_dir)
+
+    except Exception as e:
+        print(f"Warning: Could not create visualizations: {e}")
+
+
+# ---------------------- Main Execution ----------------------
+
+def main():
+    """
+    Main execution function
+    """
+    print("🎯 Starting Conformal Prediction Analysis")
+    
+    # Example hyperparameters (replace with your actual best parameters)
+    example_best_params = {
+        'input_lag': 3,
+        'output_lag': 2,
+        'hidden_units': 64,
+        'num_layers': 3,
+        'lr': 0.001,
+        'batch_size': 32,
+        'num_epochs': 100,
+        'optimizer': 'adam',
+        'weight_decay': 0.0001
+    }
+    
+    # Configuration
+    alpha = 0.1  # 90% confidence level
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    seed = 42
+    
+    print(f"Device: {device}")
+    print(f"Confidence Level: {(1-alpha)*100}%")
+    
+    # Get cluster folders
+    cluster_folders = list_cluster_folders(output_base)
+    
+    if not cluster_folders:
+        print("❌ No cluster folders found")
+        return
+    
+    print(f"Found {len(cluster_folders)} cluster folders: {cluster_folders}")
+    
+    # Run pipeline for each cluster
+    results = {}
+    
+    for cluster_folder in cluster_folders:
+        print(f"\n" + "="*60)
+        print(f"Processing: {cluster_folder}")
+        print("="*60)
+        
+        try:
+            result = run_conformal_pipeline(
+                cluster_folder=cluster_folder,
+                study_best_params=example_best_params,
+                alpha=alpha,
+                device=device,
+                seed=seed
+            )
+            
+            results[cluster_folder] = result
+            
+        except Exception as e:
+            print(f"❌ Error processing {cluster_folder}: {e}")
+            results[cluster_folder] = None
+    
+    # Summary
+    print(f"\n" + "="*60)
+    print("📊 PIPELINE SUMMARY")
+    print("="*60)
+    
+    successful = sum(1 for r in results.values() if r is not None)
+    total = len(results)
+    
+    print(f"✅ Successful: {successful}/{total}")
+    
+    for cluster, result in results.items():
+        status = "✅ Success" if result is not None else "❌ Failed"
+        print(f"   {cluster}: {status}")
+    print(f"\n🎉 Analysis complete!")
+
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import pickle
+from sklearn.preprocessing import StandardScaler
+
+def load_scaler(base_dir):
+    """Load the scaler_Y from the parent directory or try to reconstruct it"""
+    # Go up one level from conformal_results to find the scaler
+    parent_dir = os.path.dirname(base_dir)
+    
+    # Try to find existing scaler files
+    scaler_paths = [
+        os.path.join(parent_dir, 'scaler_Y.pkl'),
+        os.path.join(parent_dir, 'scaler.pkl'),
+        os.path.join(os.path.dirname(parent_dir), 'scaler_Y.pkl'),
+        os.path.join(os.path.dirname(parent_dir), 'scaler.pkl')
+    ]
+    
+    for scaler_path in scaler_paths:
+        if os.path.exists(scaler_path):
+            with open(scaler_path, 'rb') as f:
+                scaler = pickle.load(f)
+                print(f"✅ Loaded scaler from: {scaler_path}")
+                return scaler
+    
+    # If no scaler found, try to reconstruct from raw data
+    print("⚠️ No scaler found, attempting to reconstruct from raw data...")
+    
+    # Look for raw data files in parent directory
+    raw_data_files = [f for f in os.listdir(parent_dir) if f.endswith('.txt') and not f.startswith('conformal_')]
+    
+    if not raw_data_files:
+        print("❌ No raw data files found to reconstruct scaler")
+        return None
+    
+    # Try to reconstruct scaler from raw data
+    try:
+        output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+        all_data = []
+        
+        for file in raw_data_files[:5]:  # Use first 5 files to reconstruct
+            file_path = os.path.join(parent_dir, file)
+            try:
+                df = pd.read_csv(file_path, sep=None, engine='python')
+                if all([col in df.columns for col in output_vars]):
+                    clean_df = df[output_vars].dropna()
+                    if not clean_df.empty:
+                        all_data.append(clean_df)
+            except Exception as e:
+                continue
+        
+        if all_data:
+            combined_data = pd.concat(all_data, ignore_index=True)
+            from sklearn.preprocessing import StandardScaler
+            scaler_y = StandardScaler()
+            scaler_y.fit(combined_data[output_vars])
+            
+            # Save the reconstructed scaler
+            scaler_path = os.path.join(parent_dir, 'scaler_Y_reconstructed.pkl')
+            with open(scaler_path, 'wb') as f:
+                pickle.dump(scaler_y, f)
+            
+            print(f"✅ Reconstructed and saved scaler to: {scaler_path}")
+            return scaler_y
+        else:
+            print("❌ Could not reconstruct scaler from available data")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error reconstructing scaler: {e}")
+        return None
+
+def inverse_transform_columns(df, scaler_y, variables):
+    """Apply inverse transformation to the specified columns using scaler_Y"""
+    if scaler_y is None:
+        print("⚠️ No scaler_Y available, returning original data")
+        return df
+    
+    df_transformed = df.copy()
+    
+    # The output variables order from your code: ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    output_vars_order = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    
+    # Apply inverse transformation to each variable and its predictions
+    for var in variables:
+        if var not in output_vars_order:
+            print(f"⚠️ Variable {var} not found in output variables, skipping")
+            continue
+            
+        var_index = output_vars_order.index(var)
+        columns_to_transform = [var, f"{var}_pred", f"{var}_lower", f"{var}_upper"]
+        
+        for col in columns_to_transform:
+            if col in df.columns:
+                # Create dummy data with zeros for all output variables
+                dummy_data = np.zeros((len(df), len(output_vars_order)))
+                dummy_data[:, var_index] = df[col].values
+                
+                # Apply inverse transformation
+                inverse_transformed = scaler_y.inverse_transform(dummy_data)
+                df_transformed[col] = inverse_transformed[:, var_index]
+                
+                print(f"✅ Inverse transformed {col} for variable {var}")
+    
+    return df_transformed
+
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import pickle
+from sklearn.preprocessing import StandardScaler
+
+def load_scaler(base_dir):
+    """Load the scaler_Y from the parent directory or try to reconstruct it"""
+    # Go up one level from conformal_results to find the scaler
+    parent_dir = os.path.dirname(base_dir)
+    
+    # Try to find existing scaler files
+    scaler_paths = [
+        os.path.join(parent_dir, 'scaler_Y.pkl'),
+        os.path.join(parent_dir, 'scaler.pkl'),
+        os.path.join(os.path.dirname(parent_dir), 'scaler_Y.pkl'),
+        os.path.join(os.path.dirname(parent_dir), 'scaler.pkl')
+    ]
+    
+    for scaler_path in scaler_paths:
+        if os.path.exists(scaler_path):
+            with open(scaler_path, 'rb') as f:
+                scaler = pickle.load(f)
+                print(f"✅ Loaded scaler from: {scaler_path}")
+                return scaler
+    
+    # If no scaler found, try to reconstruct from raw data
+    print("⚠️ No scaler found, attempting to reconstruct from raw data...")
+    
+    # Look for raw data files in parent directory
+    raw_data_files = [f for f in os.listdir(parent_dir) if f.endswith('.txt') and not f.startswith('conformal_')]
+    
+    if not raw_data_files:
+        print("❌ No raw data files found to reconstruct scaler")
+        return None
+    
+    # Try to reconstruct scaler from raw data
+    try:
+        output_vars = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+        all_data = []
+        
+        for file in raw_data_files[:5]:  # Use first 5 files to reconstruct
+            file_path = os.path.join(parent_dir, file)
+            try:
+                df = pd.read_csv(file_path, sep=None, engine='python')
+                if all([col in df.columns for col in output_vars]):
+                    clean_df = df[output_vars].dropna()
+                    if not clean_df.empty:
+                        all_data.append(clean_df)
+            except Exception as e:
+                continue
+        
+        if all_data:
+            combined_data = pd.concat(all_data, ignore_index=True)
+            from sklearn.preprocessing import StandardScaler
+            scaler_y = StandardScaler()
+            scaler_y.fit(combined_data[output_vars])
+            
+            # Save the reconstructed scaler
+            scaler_path = os.path.join(parent_dir, 'scaler_Y_reconstructed.pkl')
+            with open(scaler_path, 'wb') as f:
+                pickle.dump(scaler_y, f)
+            
+            print(f"✅ Reconstructed and saved scaler to: {scaler_path}")
+            return scaler_y
+        else:
+            print("❌ Could not reconstruct scaler from available data")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error reconstructing scaler: {e}")
+        return None
+
+def inverse_transform_columns(df, scaler_y, variables):
+    """Apply inverse transformation to the specified columns using scaler_Y"""
+    if scaler_y is None:
+        print("⚠️ No scaler_Y available, returning original data")
+        return df
+    
+    df_transformed = df.copy()
+    
+    # The output variables order from your code: ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    output_vars_order = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+    
+    # Apply inverse transformation to each variable and its predictions
+    for var in variables:
+        if var not in output_vars_order:
+            print(f"⚠️ Variable {var} not found in output variables, skipping")
+            continue
+            
+        var_index = output_vars_order.index(var)
+        columns_to_transform = [var, f"{var}_pred", f"{var}_lower", f"{var}_upper"]
+        
+        for col in columns_to_transform:
+            if col in df.columns:
+                # Create dummy data with zeros for all output variables
+                dummy_data = np.zeros((len(df), len(output_vars_order)))
+                dummy_data[:, var_index] = df[col].values
+                
+                # Apply inverse transformation
+                inverse_transformed = scaler_y.inverse_transform(dummy_data)
+                df_transformed[col] = inverse_transformed[:, var_index]
+                
+                print(f"✅ Inverse transformed {col} for variable {var}")
+    
+    return df_transformed
+
+def plot_conformal_predictions_subplots(results_dir, output_folder_name='plots'):
+    variables = ['c', 'T_TM', 'T_PM', 'd10', 'd50', 'd90']
+    columns_to_plot = []
+    for var in variables:
+        columns_to_plot.extend([var, f"{var}_pred", f"{var}_lower", f"{var}_upper"])
+
+    output_dir = os.path.join(results_dir, output_folder_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load the scaler
+    scaler = load_scaler(results_dir)
+
+    txt_files = [f for f in os.listdir(results_dir) if f.endswith('.txt')]
+    if not txt_files:
+        print("❌ No .txt files found in the directory.")
+        return
+
+    for file in txt_files:
+        file_path = os.path.join(results_dir, file)
+        print(f"📄 Processing file: {file}")
+
+        try:
+            df = pd.read_csv(file_path, sep=None, engine='python')
+        except Exception as e:
+            print(f"❌ Failed to read {file}: {e}")
+            continue
+
+        missing_cols = [col for col in columns_to_plot if col not in df.columns]
+        if missing_cols:
+            print(f"⚠️ Skipping {file}: missing columns {missing_cols}")
+            continue
+
+        # Apply inverse transformation before plotting
+        print(f"🔄 Applying inverse transformation to {file}")
+        df = inverse_transform_columns(df, scaler, variables)
+
+        time_steps = np.arange(len(df))
+
+        fig, axs = plt.subplots(len(variables), 1, figsize=(12, 3 * len(variables)), sharex=True)
+
+        for i, var in enumerate(variables):
+            ax = axs[i]
+            # Scatter plot for actual values
+            ax.scatter(time_steps, df[var], label='True', color='black', s=20)
+            # Dashed line for predicted
+            ax.plot(time_steps, df[f"{var}_pred"], label='Predicted', color='blue', linestyle='dashed')
+            # Fill for prediction intervals
+            ax.fill_between(time_steps, df[f"{var}_lower"], df[f"{var}_upper"],
+                            color='skyblue', alpha=0.3, label='Prediction Interval')
+
+            ax.set_ylabel(var)
+            ax.grid(True, linestyle='--', alpha=0.5)
+            if i == 0:
+                ax.legend(loc='upper right')
+
+        axs[-1].set_xlabel('Timestep')
+        plt.suptitle(f"Predictions with Uncertainty (Inverse Transformed) - {file}")
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        plot_filename = f"{os.path.splitext(file)[0]}_subplots_inverse_transformed.png"
+        plot_path = os.path.join(output_dir, plot_filename)
+
+        if os.path.exists(plot_path):
+            os.remove(plot_path)
+            print(f"🗑️ Deleted existing plot: {plot_path}")
+
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✅ Saved combined subplot figure: {plot_path}")
+
+
+
+
+# Run the main function if this script is executed directly
+if __name__ == "__main__":
+    main()
+
+# compute MSE MAE for both clusters
+import os
+import pandas as pd
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+def compute_cluster_scores(cluster_paths):
+    variables = ['c', 'T_PM', 'T_TM', 'd10', 'd50', 'd90']
+    cluster_results = {}
+
+    for cluster_name, cluster_path in cluster_paths.items():
+        mse_sums = {var: 0.0 for var in variables}
+        mae_sums = {var: 0.0 for var in variables}
+        valid_counts = {var: 0 for var in variables}
+
+        txt_files = [f for f in os.listdir(cluster_path) if f.endswith('.txt')]
+        if not txt_files:
+            print(f"❌ No .txt files found in {cluster_name}")
+            continue
+
+        for file in txt_files:
+            file_path = os.path.join(cluster_path, file)
+            try:
+                df = pd.read_csv(file_path, sep=None, engine='python')
+            except Exception as e:
+                print(f"❌ Failed to read {file_path}: {e}")
+                continue
+
+            for var in variables:
+                true_col = var
+                pred_col = f"{var}_pred"
+
+                if true_col not in df.columns or pred_col not in df.columns:
+                    continue
+
+                true_vals = df[true_col]
+                pred_vals = df[pred_col]
+
+                # Drop NaNs
+                valid_idx = true_vals.notna() & pred_vals.notna()
+                if valid_idx.sum() == 0:
+                    continue
+
+                mse = mean_squared_error(true_vals[valid_idx], pred_vals[valid_idx])
+                mae = mean_absolute_error(true_vals[valid_idx], pred_vals[valid_idx])
+                mse_sums[var] += mse
+                mae_sums[var] += mae
+                valid_counts[var] += 1
+
+        # Compute cluster average
+        cluster_avg = {"State": [], "MSE": [], "MAE": []}
+        for var in variables:
+            if valid_counts[var] > 0:
+                avg_mse = mse_sums[var] / valid_counts[var]
+                avg_mae = mae_sums[var] / valid_counts[var]
+                cluster_avg["State"].append(var)
+                cluster_avg["MSE"].append(avg_mse)
+                cluster_avg["MAE"].append(avg_mae)
+            else:
+                cluster_avg["State"].append(var)
+                cluster_avg["MSE"].append(float('nan'))
+                cluster_avg["MAE"].append(float('nan'))
+
+        df_cluster = pd.DataFrame(cluster_avg)
+        cluster_results[cluster_name] = df_cluster
+        print(f"\n📊 Average Scores for {cluster_name}:\n")
+        print(df_cluster.to_string(index=False, formatters={
+            'MSE': '{:.3e}'.format,
+            'MAE': '{:.3e}'.format
+        }))
+
+    # Combine both cluster results for final average
+    if len(cluster_results) == 2:
+        df_0 = cluster_results['Cluster 0']
+        df_1 = cluster_results['Cluster 1']
+
+        final_avg = {"State": [], "MSE": [], "MAE": []}
+        for i in range(len(df_0)):
+            var = df_0.loc[i, 'State']
+            mse_mean = (df_0.loc[i, 'MSE'] + df_1.loc[i, 'MSE']) / 2
+            mae_mean = (df_0.loc[i, 'MAE'] + df_1.loc[i, 'MAE']) / 2
+            final_avg["State"].append(var)
+            final_avg["MSE"].append(mse_mean)
+            final_avg["MAE"].append(mae_mean)
+
+        df_final = pd.DataFrame(final_avg)
+        print("\n📌 Final Average Across Both Clusters:\n")
+        print(df_final.to_string(index=False, formatters={
+            'MSE': '{:.3e}'.format,
+            'MAE': '{:.3e}'.format
+        }))
+    else:
+        print("⚠️ Final average skipped. Both clusters not available.")
+
+# Define cluster paths
+cluster_paths = {
+    "Cluster 0": r"C:\Users\Mohammed Zubair Khan\Downloads\MLME\project_release\release\Data\preprocessed_psd_q98\cluster_0_q98\enhanced_files",
+    "Cluster 1": r"C:\Users\Mohammed Zubair Khan\Downloads\MLME\project_release\release\Data\preprocessed_psd_q98\cluster_1_q98\enhanced_files"
+}
+
+compute_cluster_scores(cluster_paths)
